@@ -11,6 +11,7 @@ import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from .bundled import is_frozen
 from .config import app_data_dir
 
 log = logging.getLogger(__name__)
@@ -46,11 +47,25 @@ class RoutineAccessFilter(logging.Filter):
         return status is None or status >= 400
 
 
+UVICORN_LOGGERS = ("uvicorn", "uvicorn.error")  # TidyNameFilter may have renamed it already
+
+
 class ConsoleFilter(logging.Filter):
-    """Keep yt-dlp chatter off the terminal; it is in app.log and in the job's error text."""
+    """What the terminal does not need (app.log keeps all of it).
+
+    yt-dlp chatter is in app.log and in the job's error text. In the packaged build the user was
+    just told to close the window to stop, so uvicorn's bookkeeping ("Started server process",
+    "Waiting for application startup", "Uvicorn running on ... (Press CTRL+C to quit)") is kept
+    off the console too: the app's own line with the URL is the one that matters, and it must
+    not be one of four similar-looking INFO lines. Warnings and errors from uvicorn still show.
+    """
 
     def filter(self, record: logging.LogRecord) -> bool:
-        return record.name != YTDLP_LOGGER and not record.name.startswith(YTDLP_LOGGER + ".")
+        if record.name == YTDLP_LOGGER or record.name.startswith(YTDLP_LOGGER + "."):
+            return False
+        if record.name in UVICORN_LOGGERS and record.levelno < logging.WARNING and is_frozen():
+            return False
+        return True
 
 
 class TidyNameFilter(logging.Filter):

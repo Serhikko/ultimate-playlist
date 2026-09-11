@@ -49,7 +49,8 @@ def test_app_data_dir_default(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_defaults() -> None:
     s = Settings()
-    assert s.library_dir == Path.home() / "Music" / "Ultimate Playlist"
+    assert s.library_dir == config.music_dir() / "Ultimate Playlist"
+    assert s.library_dir.is_absolute()
     assert s.audio_format == "mp3"
     assert s.audio_quality == "0"
     assert s.ffmpeg_path is None

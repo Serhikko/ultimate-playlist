@@ -27,6 +27,7 @@ if str(TESTS_DIR) not in sys.path:  # so `from fake_provider import ...` works i
 
 from fake_provider import FakeProvider  # noqa: E402
 
+from ultimate_playlist.bundled import ENV_BIN  # noqa: E402
 from ultimate_playlist.config import ENV_HOME, Settings  # noqa: E402
 from ultimate_playlist.downloader import JobManager  # noqa: E402
 from ultimate_playlist.ffmpeg import FfmpegInfo  # noqa: E402
@@ -39,9 +40,14 @@ STUB_NODE = SimpleNamespace(name="node", path="node", version="24.0.0-test", sup
 
 @pytest.fixture(autouse=True)
 def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Every test gets its own app data dir; the real home is never touched."""
+    """Every test gets its own app data dir; the real home is never touched.
+
+    ULTIMATE_PLAYLIST_BIN is cleared too, so a developer who points it at a real tools
+    folder in their shell does not make doctor / status tests see bundled binaries.
+    """
     home = tmp_path / "home"
     monkeypatch.setenv(ENV_HOME, str(home))
+    monkeypatch.delenv(ENV_BIN, raising=False)
     return home
 
 

@@ -26,8 +26,9 @@ from mutagen.mp4 import MP4, MP4FreeForm
 from mutagen.oggopus import OggOpus
 from mutagen.oggvorbis import OggVorbis
 
+from ..bundled import bundled_tool, is_bundled, is_frozen
 from ..config import Settings
-from ..ffmpeg import find_ffmpeg, install_hint
+from ..ffmpeg import find_ffmpeg, install_hint, missing_bundled_hint, resolve_explicit
 from ..library import read_tags
 from ..models import JobStatus, ProgressEvent, Track, TrackRef
 from .base import DownloadCancelled, ProgressCallback, ProviderError
@@ -45,6 +46,9 @@ MP4_ID_KEY = f"----:com.apple.iTunes:{TXXX_ID_DESC}"  # what library.read_tags()
 # name as free and overwrite each other.
 _move_lock = threading.Lock()
 DEFAULT_JS_RUNTIMES: tuple[str, ...] = ("deno", "node")
+# yt-dlp runtime key -> executable name when they differ (yt_dlp/utils/_jsruntime.py looks for
+# `qjs`, not `quickjs`); the others are named after the runtime.
+RUNTIME_BINARY: dict[str, str] = {"quickjs": "qjs"}
 MAX_FILENAME_LEN = 150
 _ERROR_DETAIL_LEN = 200
 
@@ -456,12 +460,87 @@ class _YdlLogger:
         ydl_log.error(text)
 
 
-def _js_runtimes_opt(names: list[str] | tuple[str, ...] | None) -> dict[str, dict[str, Any]]:
-    """yt-dlp only auto-enables Deno; we enable every configured runtime with PATH lookup."""
+def _bundled_runtime(name: str) -> str | None:
+    """Path of the runtime's executable in the package's bin folder, else None."""
+    return bundled_tool(RUNTIME_BINARY.get(name, name))
+
+
+def _shipped_runtimes() -> dict[str, str]:
+    """The runtimes the package actually carries in ``bin`` (deno.exe and/or node.exe)."""
+    found = {name: _bundled_runtime(name) for name in DEFAULT_JS_RUNTIMES}
+    return {name: path for name, path in found.items() if path}
+
+
+_warned_unbundled_runtimes: set[tuple[str, ...]] = set()
+
+
+def _effective_runtimes(names: list[str] | tuple[str, ...] | None) -> dict[str, str | None]:
+    """Configured runtime -> bundled path (None = yt-dlp looks the name up on PATH).
+
+    In the packaged build, as soon as one configured runtime ships in ``bin``, the others are
+    dropped: yt-dlp ranks Deno above Node regardless of order, so a stray Deno on PATH would
+    otherwise win over the bundled Node and the package would not be isolated from the machine.
+    A configuration that names only runtimes the package does not carry (``["deno"]`` with a
+    zip built around node.exe) falls back to the shipped ones, logged once: the bundled runtime
+    is right there and a PATH lookup on a clean machine finds nothing. From source every
+    configured runtime stays enabled.
+    """
     cleaned = [str(n).strip().lower() for n in (names or ()) if str(n).strip()]
     if not cleaned:
         cleaned = list(DEFAULT_JS_RUNTIMES)
-    return {name: {"path": None} for name in dict.fromkeys(cleaned)}
+    runtimes = {name: _bundled_runtime(name) for name in dict.fromkeys(cleaned)}
+    if is_frozen():
+        if any(runtimes.values()):
+            runtimes = {name: path for name, path in runtimes.items() if path}
+        else:
+            shipped = _shipped_runtimes()
+            if shipped:
+                key = tuple(runtimes)
+                if key not in _warned_unbundled_runtimes:
+                    _warned_unbundled_runtimes.add(key)
+                    log.warning(
+                        "js_runtimes %s not bundled; using the packaged %s",
+                        list(runtimes),
+                        ", ".join(shipped),
+                    )
+                runtimes = dict(shipped)
+    return runtimes
+
+
+def _js_runtimes_opt(names: list[str] | tuple[str, ...] | None) -> dict[str, dict[str, Any]]:
+    """yt-dlp only auto-enables Deno; we enable every configured runtime.
+
+    A runtime shipped in the package's ``bin`` folder is pinned by path so the no-install build
+    works on a machine with nothing on PATH; ``None`` leaves yt-dlp to look the name up on PATH.
+    """
+    return {name: {"path": path} for name, path in _effective_runtimes(names).items()}
+
+
+_warned_ffmpeg_paths: set[str] = set()
+
+
+def _ffmpeg_location(settings: Settings) -> str | None:
+    """What to hand yt-dlp as ``ffmpeg_location``: the file the configured ``ffmpeg_path``
+    resolves to (``find_ffmpeg`` resolves it the same way: a file, a folder holding ffmpeg.exe,
+    or a bare name on PATH), else the bundled bin *folder* (so ffprobe is found next to ffmpeg),
+    else None (yt-dlp searches PATH). yt-dlp finds ffprobe next to a file path as well.
+
+    yt-dlp silently "continues without ffmpeg" when the location does not exist, which turns
+    every download into a failed MP3 conversion; a stale ``ffmpeg_path`` from an uninstalled
+    ffmpeg must therefore fall back exactly like ``find_ffmpeg`` does, and be logged once.
+    """
+    explicit = settings.ffmpeg_path
+    if explicit:
+        resolved = resolve_explicit(explicit)
+        if resolved:
+            return resolved
+        if explicit not in _warned_ffmpeg_paths:
+            _warned_ffmpeg_paths.add(explicit)
+            log.warning("ffmpeg_path %s does not exist; ignoring it", explicit)
+    bundled_ffmpeg = bundled_tool("ffmpeg")
+    if bundled_ffmpeg:
+        return str(Path(bundled_ffmpeg).parent)
+    return None
 
 
 def _float_or_none(value: Any) -> float | None:
@@ -559,8 +638,9 @@ def _ydl_opts(
         "progress_hooks": [hook],
         "postprocessor_hooks": [pp_hook],
     }
-    if settings.ffmpeg_path:
-        opts["ffmpeg_location"] = settings.ffmpeg_path
+    location = _ffmpeg_location(settings)
+    if location:
+        opts["ffmpeg_location"] = location
     return opts
 
 
@@ -804,27 +884,54 @@ def _runtime_info(name: str) -> Any:
         }.get(name)
         if cls is None:
             return None
-        info = cls().info
+        info = cls(path=_bundled_runtime(name)).info  # path=None means "look on PATH"
         return info() if callable(info) else info
     except Exception as exc:  # noqa: BLE001 - probing must never raise
         log.debug("JS runtime probe for %s failed: %s", name, exc)
         return None
 
 
+def _js_runtime_hint(names: list[str] | tuple[str, ...]) -> str:
+    """How to get a runtime: re-extract the zip in the packaged build, install one from source.
+
+    The packaged hint names the runtime the zip really carries (``bin\\node.exe`` for a build
+    around Node) when one is there; when the bin folder holds none (quarantined, half
+    extracted) it lists the acceptable ones and points at the folder, not at ``deno.exe``.
+    """
+    shipped = _shipped_runtimes()
+    if shipped:
+        display = " or ".join(f"bin\\{RUNTIME_BINARY.get(n, n)}.exe" for n in shipped)
+        first = next(iter(shipped))
+        bundled = missing_bundled_hint(display, RUNTIME_BINARY.get(first, first))
+    else:
+        display = " or ".join(f"bin\\{RUNTIME_BINARY.get(n, n)}.exe" for n in names)
+        bundled = missing_bundled_hint(display or "bin\\deno.exe or bin\\node.exe")
+    if bundled:
+        return bundled
+    return "Install Deno: winget install DenoLand.Deno (or Node.js 22+)"
+
+
 def _js_runtime_check(names: list[str] | tuple[str, ...]) -> tuple[bool, str]:
-    hint = "Install Deno: winget install DenoLand.Deno (or Node.js 22+)"
+    hint = _js_runtime_hint(names)
+    # Probe the runtimes yt-dlp will really use (the bundled ones only, in the packaged build).
+    names = list(_effective_runtimes(names))
     found = [(name, _runtime_info(name)) for name in names]
     found = [(name, info) for name, info in found if info is not None]
     for name, info in found:
         if getattr(info, "supported", True):
             version = getattr(info, "version", None) or "unknown version"
             path = getattr(info, "path", None) or name
-            return True, f"{getattr(info, 'name', name)} {version} ({path})"
+            binary = RUNTIME_BINARY.get(name, name)  # quickjs ships as qjs.exe
+            where = f"{path}, bundled" if is_bundled(binary, path) else path
+            return True, f"{getattr(info, 'name', name)} {version} ({where})"
     if found:
         name, info = found[0]
         version = getattr(info, "version", None) or "unknown version"
         return False, f"{name} {version} is too old for yt-dlp. {hint}"
-    for name in names:  # yt-dlp probe unavailable: fall back to a plain PATH lookup
+    for name in names:  # yt-dlp probe unavailable: fall back to a plain lookup, bin folder first
+        bundled = _bundled_runtime(name)
+        if bundled:
+            return True, f"{name} ({bundled}, bundled)"
         path = shutil.which(name)
         if path:
             return True, f"{name} ({path})"
@@ -1021,7 +1128,7 @@ class YouTubeProvider:
         try:
             ffmpeg = find_ffmpeg(settings.ffmpeg_path if settings else None)
             if ffmpeg.found:
-                checks.append((True, "ffmpeg", f"{ffmpeg.path} ({ffmpeg.version})"))
+                checks.append((True, "ffmpeg", ffmpeg.describe()))
             else:
                 checks.append((False, "ffmpeg", install_hint()))
         except Exception as exc:  # noqa: BLE001 - doctor never raises

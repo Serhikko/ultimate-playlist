@@ -50,7 +50,36 @@ def test_tidy_name_filter_renames_uvicorn_error() -> None:
     assert flt.filter(rec) and rec.name == "uvicorn.access"
 
 
-def test_build_handlers_console_and_rotating_file(tmp_settings: Settings) -> None:
+def test_console_filter_drops_uvicorn_bookkeeping_only_when_frozen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exe's window says 'close this window to stop' and shows one line with the URL;
+    uvicorn's three startup lines and its Ctrl+C advice must not bury it (app.log keeps them)."""
+    flt = logs.ConsoleFilter()
+    tidy = logs.TidyNameFilter()
+    lines = [
+        "Started server process [36132]",
+        "Waiting for application startup.",
+        "Application startup complete.",
+        "Uvicorn running on http://127.0.0.1:8765 (Press CTRL+C to quit)",
+    ]
+    for line in lines:  # from source the terminal shows them, Ctrl+C included
+        assert flt.filter(_record("uvicorn.error", line))
+        assert flt.filter(_record("uvicorn", line))
+    monkeypatch.setattr(logs, "is_frozen", lambda: True)
+    for line in lines:
+        assert not flt.filter(_record("uvicorn.error", line))
+        assert not flt.filter(_record("uvicorn", line))  # renamed by TidyNameFilter first
+    assert flt.filter(_record("uvicorn.error", "Port in use", level=logging.WARNING))
+    assert flt.filter(_record("uvicorn.error", "boom", level=logging.ERROR))
+    assert flt.filter(_record("ultimate_playlist.server.app", "Ultimate Playlist 0.1.0 at ..."))
+    rec = _record("uvicorn.error", "Started server process")
+    assert tidy.filter(rec) and rec.name == "uvicorn"  # TidyNameFilter only renames
+
+
+def test_build_handlers_console_and_rotating_file(
+    tmp_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
     handlers = logs.build_handlers(console_level=logging.WARNING, file_level=logging.INFO)
     try:
         assert len(handlers) == 2
@@ -67,6 +96,11 @@ def test_build_handlers_console_and_rotating_file(tmp_settings: Settings) -> Non
         assert file_handler.filter(chatter)
         # routine polling: neither
         assert not console.filter(_access(200)) and not file_handler.filter(_access(200))
+        # the packaged build: uvicorn's bookkeeping stays in the file only
+        monkeypatch.setattr(logs, "is_frozen", lambda: True)
+        startup = _record("uvicorn.error", "Application startup complete.")
+        assert not console.filter(startup)
+        assert file_handler.filter(startup) and startup.name == "uvicorn"
     finally:
         for handler in handlers:
             handler.close()

@@ -30,6 +30,18 @@ def test_version(capsys: pytest.CaptureFixture[str]) -> None:
     assert capsys.readouterr().out.strip() == f"up {__version__}"
 
 
+def test_frozen_exe_uses_its_own_name(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """There is no `up` in the zip: usage and errors must say UltimatePlaylist.exe."""
+    monkeypatch.setattr(cli, "is_frozen", lambda: True)
+    monkeypatch.setattr(sys, "executable", r"D:\Apps\UltimatePlaylist\UltimatePlaylist.exe")
+    assert cli.main(["--version"]) == 0
+    assert capsys.readouterr().out.strip() == f"UltimatePlaylist.exe {__version__}"
+    assert cli.main(["bogus"]) == 2
+    assert "UltimatePlaylist.exe: error" in capsys.readouterr().err
+
+
 def test_help_and_usage_errors(capsys: pytest.CaptureFixture[str]) -> None:
     assert cli.main(["--help"]) == 0
     assert "COMMAND" in capsys.readouterr().out
@@ -53,7 +65,7 @@ def test_no_subcommand_runs_serve(tmp_settings: Settings, monkeypatch: pytest.Mo
         "host": "127.0.0.1",
         "port": 8765,
         "open_browser": True,
-        "lib": Path.home() / "Music" / "Ultimate Playlist",
+        "lib": Settings().library_dir,
     }
     tmp_settings.save()  # a saved config.json is what `up` picks up
     assert cli.main([]) == 0
@@ -88,6 +100,141 @@ def test_library_override_is_made_absolute(tmp_path: Path, monkeypatch: pytest.M
     env_form = "$UP_TEST_LIB" if sys.platform != "win32" else "%UP_TEST_LIB%"
     assert cli.load_settings(env_form) == cli.load_settings(str(tmp_path / "env"))
     assert cli.load_settings("~").library_dir == Path.home()
+
+
+def test_frozen_second_start_joins_the_running_instance(
+    tmp_settings: Settings, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A second double-click must not start a second server (and queue) on the next port."""
+    from ultimate_playlist.server import app as server_app
+
+    served: list[int] = []
+    opened: list[str] = []
+    probes: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        server_app, "serve", lambda s, host, port, open_browser: served.append(port)
+    )
+    monkeypatch.setattr(cli.webbrowser, "open", lambda url: opened.append(url))
+    monkeypatch.setattr(cli, "is_frozen", lambda: True)
+    monkeypatch.setattr(cli, "_set_console_title", lambda title: None)
+
+    def running(host: str, port: int, timeout: float = 1.0) -> str | None:
+        probes.append((host, port))
+        return "http://127.0.0.1:8765/"
+
+    monkeypatch.setattr(cli, "running_instance", running)
+    monkeypatch.setattr(cli, "JOIN_PAUSE", 0.0)
+    assert cli.main([]) == 0
+    out = capsys.readouterr().out
+    assert "already running at http://127.0.0.1:8765/ - opening it in your browser." in out
+    assert "closes by itself" in out and "close this window" not in out  # it closes at once
+    assert served == [] and opened == ["http://127.0.0.1:8765/"] and probes == [("127.0.0.1", 8765)]
+
+    assert cli.main(["serve", "--no-browser"]) == 0  # joins too, but opens nothing
+    assert served == [] and opened == ["http://127.0.0.1:8765/"]
+
+    assert cli.main(["serve", "--port", "8791"]) == 0  # an explicit port is the user's choice
+    assert served == [8791] and len(probes) == 2
+
+    monkeypatch.setattr(cli, "running_instance", lambda host, port, timeout=1.0: None)
+    assert cli.main([]) == 0  # nothing of ours on 8765: start as usual
+    assert served == [8791, 8765]
+
+
+def test_second_start_finds_the_instance_on_a_fallback_port(
+    tmp_settings: Settings, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A foreign program on 8765 pushed the first start to 8766: the second must join it there
+    instead of starting a third server on 8767."""
+    from ultimate_playlist.server import app as server_app
+
+    served: list[int] = []
+    opened: list[str] = []
+    probes: list[int] = []
+    monkeypatch.setattr(
+        server_app, "serve", lambda s, host, port, open_browser: served.append(port)
+    )
+    monkeypatch.setattr(cli.webbrowser, "open", lambda url: opened.append(url))
+    monkeypatch.setattr(cli, "is_frozen", lambda: True)
+    monkeypatch.setattr(cli, "_set_console_title", lambda title: None)
+    monkeypatch.setattr(cli, "JOIN_PAUSE", 0.0)
+
+    def running(host: str, port: int, timeout: float = cli.JOIN_TIMEOUT) -> str | None:
+        probes.append(port)
+        return f"http://{host}:{port}/" if port == cli.DEFAULT_PORT + 1 else None
+
+    monkeypatch.setattr(cli, "running_instance", running)
+    assert cli.main([]) == 0
+    assert served == [] and opened == ["http://127.0.0.1:8766/"]
+    assert probes == [8765, 8766]
+    assert "already running at http://127.0.0.1:8766/" in capsys.readouterr().out
+
+    probes.clear()
+    monkeypatch.setattr(cli, "running_instance", lambda host, port, timeout=0.0: None)
+    assert cli.main([]) == 0  # the whole range is scanned before a server is started
+    assert served == [8765]
+    assert cli.find_running_instance("127.0.0.1", 8765) is None
+
+
+def test_port_range_matches_the_server() -> None:
+    """cli.PORT_ATTEMPTS is a copy (importing server.app would load FastAPI for `up list`)."""
+    from ultimate_playlist.server import app as server_app
+
+    assert cli.PORT_ATTEMPTS == server_app.PORT_ATTEMPTS == 11
+
+
+def test_installed_metadata_version_matches_the_package() -> None:
+    """pyproject.toml and ultimate_playlist.__version__ are hand-maintained copies; the tag
+    check reads one and the zip name the other, so they must never drift apart."""
+    import importlib.metadata
+
+    try:
+        installed = importlib.metadata.version("ultimate-playlist")
+    except importlib.metadata.PackageNotFoundError:
+        pytest.skip("ultimate-playlist is not installed in this environment")
+    assert installed == __version__
+
+
+def test_running_instance_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    import io
+    import json
+    import urllib.error
+    import urllib.request
+
+    answers: dict[str, object] = {}
+
+    class Response(io.BytesIO):
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            self.close()
+
+    def fake_urlopen(url: str, timeout: float = 0) -> Response:
+        answers["url"] = url
+        answers["timeout"] = timeout
+        payload = answers.get("payload")
+        if isinstance(payload, Exception):
+            raise payload
+        return Response(json.dumps(payload).encode("utf-8"))
+
+    # the probe must not go through HTTP_PROXY: the opener carries no proxy handler at all
+    assert not any(isinstance(h, urllib.request.ProxyHandler) for h in cli._opener.handlers)
+    monkeypatch.setattr(cli._opener, "open", fake_urlopen)
+    answers["payload"] = {"version": __version__}
+    assert cli.running_instance("127.0.0.1", 8765) == "http://127.0.0.1:8765/"
+    assert answers["url"] == "http://127.0.0.1:8765/api/version"  # probe-free endpoint
+    assert answers["timeout"] == cli.JOIN_TIMEOUT == 3.0
+    assert cli.running_instance("127.0.0.1", 8766, timeout=0.5) == "http://127.0.0.1:8766/"
+    assert answers["url"] == "http://127.0.0.1:8766/api/version" and answers["timeout"] == 0.5
+    answers["payload"] = {"version": "0.0.0-other"}  # an older copy still running: leave it alone
+    assert cli.running_instance("127.0.0.1", 8765) is None
+    answers["payload"] = ["not", "an", "object"]
+    assert cli.running_instance("127.0.0.1", 8765) is None
+    answers["payload"] = urllib.error.URLError("connection refused")
+    assert cli.running_instance("127.0.0.1", 8765) is None
+    answers["payload"] = TimeoutError("timed out")
+    assert cli.running_instance("127.0.0.1", 8765) is None
 
 
 def test_serve_reports_a_port_problem_and_exits_1(

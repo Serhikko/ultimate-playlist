@@ -426,8 +426,8 @@
         label: 'ffmpeg',
         short: 'ff',
         tip: ffmpegOk
-          ? `ffmpeg ${ffmpeg.version || ''}\n${ffmpeg.path}`
-          : (ffmpegCheck && ffmpegCheck.detail) || 'ffmpeg was not found. Install it and restart the app.',
+          ? `ffmpeg ${ffmpeg.version || ''}${ffmpeg.bundled ? ' (bundled)' : ''}\n${ffmpeg.path}`
+          : (ffmpegCheck && ffmpegCheck.detail) || 'ffmpeg was not found. Run "doctor" to see what to do, then restart the app.',
       }),
     );
 

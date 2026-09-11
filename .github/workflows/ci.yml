@@ -16,8 +16,10 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        # 3.14 is what the app ships on (docs/SPEC.md); 3.12 guards the requires-python floor.
-        python-version: ["3.12", "3.14"]
+        # 3.14 is what the app ships on (.python-version; release.yml freezes the Windows package
+        # with it); 3.11 is the oldest interpreter requires-python allows, so it is the one
+        # that guards the lower bound.
+        python-version: ["3.11", "3.14"]
     steps:
       - uses: actions/checkout@v4
 

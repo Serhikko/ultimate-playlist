@@ -139,7 +139,8 @@ def test_status_shape(client: TestClient, library: Library) -> None:
     assert data["library_dir"] == str(library.library_dir)
     assert data["tracks"] == 1
     assert data["jobs_active"] == 0
-    assert set(data["ffmpeg"]) == {"path", "version"}
+    assert set(data["ffmpeg"]) == {"path", "version", "bundled"}
+    assert data["ffmpeg"]["bundled"] is False
     names = [p["name"] for p in data["providers"]]
     assert "fake" in names
     fake = next(p for p in data["providers"] if p["name"] == "fake")
@@ -147,6 +148,20 @@ def test_status_shape(client: TestClient, library: Library) -> None:
     assert fake["checks"] == [
         {"ok": True, "label": "Fake provider", "detail": "offline stub, always available"}
     ]
+
+
+def test_version_endpoint_does_no_work(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A second UltimatePlaylist.exe asks /api/version to find the running copy; it must
+    answer at once even while ffmpeg / the JS runtime are being probed for /api/status."""
+
+    def never(explicit: str | None = None) -> None:
+        raise AssertionError("/api/version must not probe ffmpeg")
+
+    monkeypatch.setattr(server_app, "find_ffmpeg", never)
+    monkeypatch.setattr(server_app, "provider_status", never)
+    response = client.get("/api/version")
+    assert response.status_code == 200
+    assert response.json() == {"version": __version__}
 
 
 def test_status_survives_a_broken_provider(

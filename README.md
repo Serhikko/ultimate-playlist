@@ -19,6 +19,45 @@ What it does:
   twice.
 - Playlists: create, reorder, export as `.m3u8`. Built-in player with queue, shuffle and repeat.
 
+## No-install version (Windows)
+
+Nothing to install: not uv, not Python, not ffmpeg, not Node.
+
+1. Download `UltimatePlaylist-<version>-windows-x64.zip` from the
+   [Releases page](https://github.com/Serhikko/ultimate-playlist/releases) and unzip it anywhere
+   (Desktop, `D:\Apps`, a USB stick). Extract the whole zip: double-clicking the exe inside the
+   zip preview does not work.
+2. Double-click `UltimatePlaylist.exe`. A console window opens and your browser opens the app.
+   If no browser tab appears, open <http://127.0.0.1:8765> yourself (the address is also printed
+   in the console window). Close the console window to stop the app. Double-clicking the exe
+   again while the app runs only reopens it in the browser.
+3. The first time, Windows may show "Windows protected your PC" (SmartScreen, because the
+   program is not signed with a paid certificate): click **More info**, then **Run anyway**.
+
+Everything is inside that folder (ffmpeg and a JavaScript runtime are in `bin/`); delete the
+folder to uninstall. Your music goes to your Music folder, in a sub-folder called
+`Ultimate Playlist` (`C:\Users\<you>\Music\Ultimate Playlist`, or under `OneDrive\Music` when
+OneDrive manages your Music folder), and your settings to `C:\Users\<you>\.ultimate-playlist`.
+To update, unzip the new version and delete the old folder. To remove every trace, also delete
+`C:\Users\<you>\.ultimate-playlist` (settings, index, log). The MP3s in `Music\Ultimate Playlist`
+are ordinary files: keep or delete them as you like.
+
+If something goes wrong:
+
+- **Every download suddenly fails**: YouTube changed something and the bundled yt-dlp needs an
+  update. Download the newest zip from the [Releases page](https://github.com/Serhikko/ultimate-playlist/releases)
+  and replace the folder.
+- **To see what is wrong**, open a terminal in the folder (right-click an empty spot inside the
+  folder and choose "Open in Terminal"; on Windows 10: Shift + right-click > "Open PowerShell
+  window here") and run `.\UltimatePlaylist.exe doctor`.
+- **`doctor` says ffmpeg or the JavaScript runtime is missing**: the `bin` folder is
+  incomplete (a partial extraction, or your antivirus quarantined a file). Extract the zip again.
+- **`UltimatePlaylist.exe` disappears, or Windows Security reports a threat**: a false positive
+  that is common for unsigned programs built with PyInstaller. Open Windows Security >
+  Protection history, choose Restore (or Allow), then run it again.
+
+The sections below are for running from source.
+
 ## Requirements
 
 Developed and tested on Windows 11; macOS and Linux should work with the equivalents below.
@@ -90,7 +129,7 @@ and `uv run python -m ultimate_playlist` are the same as `uv run up`.
 
 | What | Where |
 | --- | --- |
-| Music library (the MP3s) | `~/Music/Ultimate Playlist` (Windows: `C:\Users\<you>\Music\Ultimate Playlist`) |
+| Music library (the MP3s) | `~/Music/Ultimate Playlist` (Windows: the Music folder Explorer shows, so `C:\Users\<you>\Music\Ultimate Playlist` or `C:\Users\<you>\OneDrive\Music\Ultimate Playlist` when OneDrive manages it) |
 | Exported playlists | `<library>/Playlists/<name>.m3u8` |
 | Temporary download files | `<library>/.incoming/` (cleaned up automatically; safe to empty while the app is closed) |
 | Config, index, playlists, log | `~/.ultimate-playlist/` : `config.json`, `library.json`, `playlists.json`, `app.log` |
@@ -101,7 +140,8 @@ changing it re-points the library and rescans the new folder.
 
 `config.json` is created with defaults the first time settings are saved. Keys: `library_dir`,
 `audio_format` (`mp3`; the only format exercised in v0.1), `audio_quality` (`"0"` = best VBR),
-`ffmpeg_path` (only if ffmpeg is not on `PATH`), `concurrency` (parallel downloads, 1..6; a
+`ffmpeg_path` (only if ffmpeg is not on `PATH`; a path that no longer exists is ignored with
+a warning and `doctor` says so), `concurrency` (parallel downloads, 1..6; a
 change through `PUT /api/settings` resizes the running download pool at once), `embed_cover`,
 `js_runtimes` (`["deno", "node"]`; `bun` and `quickjs` are accepted too). A missing or broken
 file means defaults; the app never refuses to start because of it. Edit it while the app is
@@ -132,7 +172,10 @@ restriction for LAN use.
 - Files you copy into the folder from elsewhere are picked up by `rescan` (MP3, M4A, Opus, FLAC),
   with their existing tags, under a `local:` id.
 
-## Troubleshooting
+## Troubleshooting (running from source)
+
+Using the no-install zip? The remedies for that are in the [No-install version](#no-install-version-windows)
+section above; the commands below assume a source checkout.
 
 - **First stop: `uv run up doctor`.** It runs the same checks as the status chips at the top of
   the web UI and prints how to fix whatever is missing.
@@ -201,11 +244,15 @@ uv run ruff format .      # format
 ```
 
 CI (`.github/workflows/ci.yml`) runs the same lint and tests on `ubuntu-latest` and
-`windows-latest` with Python 3.12 and 3.14; the suite needs neither ffmpeg nor a JavaScript
+`windows-latest` with Python 3.11 (the oldest supported) and 3.14; the suite needs neither ffmpeg nor a JavaScript
 runtime (tool detection is stubbed, see `tests/conftest.py`). The contract every module is
 written against is
 [docs/SPEC.md](docs/SPEC.md); how the pieces fit together, and how to add a provider, is in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+The Windows no-install zip is built with `uv run python scripts/build_windows.py` (PyInstaller
+plus bundled ffmpeg and Deno/Node) and published by `.github/workflows/release.yml` when a `v*`
+tag is pushed; see [docs/PACKAGING.md](docs/PACKAGING.md).
 
 ## License
 

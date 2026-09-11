@@ -1,0 +1,109 @@
+name: Release (Windows package)
+
+# Builds dist/UltimatePlaylist-<version>-windows-x64.zip (PyInstaller + bundled ffmpeg + Deno)
+# and attaches it to the GitHub release for the pushed tag. See docs/PACKAGING.md.
+#
+#   git tag v0.1.0 && git push --tags
+#
+# workflow_dispatch builds the same zip (named ...-devNN) and keeps it as a workflow artifact
+# without creating or touching a release, whatever ref it is started from; that is the way to
+# test a change to the packaging.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows package
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Never let the build or the smoke test touch the runner's profile.
+      ULTIMATE_PLAYLIST_HOME: ${{ runner.temp }}/up-home
+      SMOKE_PORT: "8791"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          # The interpreter the app ships on (the same one the test matrix in ci.yml and
+          # .python-version use, so a local build produces the same package).
+          python-version: "3.14"
+
+      - name: Install dependencies (runtime + build + dev groups)
+        run: uv sync --all-groups
+
+      - name: Check that the tag matches the package version
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        run: |
+          version="$(uv run python -c 'import ultimate_playlist; print(ultimate_playlist.__version__)')"
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match ultimate_playlist.__version__ ($version)"
+            exit 1
+          fi
+
+      - name: Build the package (downloads the official ffmpeg and Deno builds, checksummed)
+        run: |
+          suffix=""
+          if [ "${{ github.event_name }}" != "push" ]; then
+            suffix="-dev${{ github.run_number }}"
+          fi
+          # `=` form: argparse would take a bare "-devNN" for an option name.
+          uv run python scripts/build_windows.py --ffmpeg download --js-runtime download --version-suffix="$suffix"
+
+      - name: Smoke test the frozen app (version, doctor)
+        run: |
+          mkdir -p "$ULTIMATE_PLAYLIST_HOME"
+          dist/UltimatePlaylist/UltimatePlaylist.exe --version
+          dist/UltimatePlaylist/UltimatePlaylist.exe --library "${RUNNER_TEMP}/up-library" doctor
+          ls -la dist/UltimatePlaylist/bin
+          ls -la dist/*.zip
+
+      - name: "Smoke test the frozen app (serve: the web UI must be in the bundle)"
+        # The exe is a background process: without the trap a failed check would leave it
+        # running and the step would hang until the job timeout with nothing in the log.
+        timeout-minutes: 10
+        run: |
+          dist/UltimatePlaylist/UltimatePlaylist.exe --library "${RUNNER_TEMP}/up-library" serve --no-browser --port "$SMOKE_PORT" > "$RUNNER_TEMP/serve.log" 2>&1 &
+          pid=$!
+          trap 'kill $pid 2>/dev/null || true; echo "--- serve.log ---"; cat "$RUNNER_TEMP/serve.log"' EXIT
+          for i in $(seq 1 30); do
+            curl -fsS "http://127.0.0.1:${SMOKE_PORT}/api/version" >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -fsS "http://127.0.0.1:${SMOKE_PORT}/api/version"
+          echo
+          curl -fsS "http://127.0.0.1:${SMOKE_PORT}/" | grep -q '<html'
+          curl -fsS "http://127.0.0.1:${SMOKE_PORT}/api/status"
+          echo
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UltimatePlaylist-windows-x64
+          path: dist/*.zip
+          if-no-files-found: error
+          # "Re-run failed jobs" after a publish hiccup uploads into the same run again.
+          overwrite: true
+
+      - name: Publish the GitHub release
+        # A tag push only: a workflow_dispatch run started from a tag must never attach its
+        # -devNN zip to the real release.
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $tag exists; replacing the asset"
+            gh release upload "$tag" dist/*.zip --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" dist/*.zip --title "$tag" --generate-notes --repo "$GITHUB_REPOSITORY"
+          fi

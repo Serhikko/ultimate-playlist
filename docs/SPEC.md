@@ -21,6 +21,9 @@ same `Provider` protocol, so the provider layer must be the only place that know
   --embed-metadata` a download + convert + cover embed works end to end.
 - Windows MAX_PATH bites: yt-dlp failed writing a thumbnail into a ~250-char path. Keep intermediate
   files in a short path (`<library>/.incoming/<source_id>.<ext>`), never in deep temp dirs.
+- The no-install Windows build (PyInstaller onedir, see `docs/PACKAGING.md`) ships `ffmpeg.exe`,
+  `ffprobe.exe` and `deno.exe` or `node.exe` in `<folder of the exe>/bin`. Those MUST win over
+  anything on PATH (`bundled.py`), so the zip works on a machine with nothing installed.
 - Tests must not touch the network. Real YouTube is exercised only by the integration step.
 
 ## Layout
@@ -32,6 +35,7 @@ src/ultimate_playlist/
   cli.py                 argparse CLI (see below)
   config.py              Settings + app data dir
   ffmpeg.py              locate ffmpeg
+  bundled.py             tools shipped next to the packaged exe (<exe dir>/bin or $ULTIMATE_PLAYLIST_BIN)
   models.py              FROZEN
   downloader.py          JobManager (queue + worker threads)
   library.py             Library (index of finished tracks, tag reading, rescan)
@@ -48,6 +52,10 @@ src/ultimate_playlist/
 tests/                   pytest, offline, uses FakeProvider (see Testing)
 docs/SPEC.md             this file
 docs/ARCHITECTURE.md     for contributors (the Spotify friend): how a provider is wired in
+docs/PACKAGING.md        the Windows no-install zip: layout, build script, release workflow
+packaging/               PyInstaller spec (ultimate-playlist.spec), frozen entry point, icon generator
+scripts/build_windows.py PyInstaller -> dist/UltimatePlaylist/ + bin/ tools + notices -> zip
+.github/workflows/release.yml  builds and publishes the zip when a v* tag is pushed
 README.md                user-facing
 .github/workflows/ci.yml ruff + pytest on ubuntu-latest and windows-latest
 ```
@@ -59,13 +67,17 @@ APP_NAME = "ultimate-playlist"
 
 def app_data_dir() -> Path
     # env ULTIMATE_PLAYLIST_HOME if set, else ~/.ultimate-playlist. Created on demand.
+def music_dir() -> Path
+    # Windows: the FOLDERID_Music known folder via SHGetKnownFolderPath (OneDrive's Known Folder
+    # Move puts it under OneDrive\Music); elsewhere, or on any failure, ~/Music.
 
 @dataclass
 class Settings:
-    library_dir: Path = Path.home() / "Music" / "Ultimate Playlist"
+    library_dir: Path = music_dir() / "Ultimate Playlist"
     audio_format: str = "mp3"          # only mp3 is exercised in v0.1 but keep it a setting
     audio_quality: str = "0"           # yt-dlp preferredquality; "0" = VBR best
-    ffmpeg_path: str | None = None     # explicit override, else PATH
+    ffmpeg_path: str | None = None     # explicit override, else bundled bin folder, else PATH; a path that
+                                       # does not exist is ignored (logged once) so doctor and downloads agree
     concurrency: int = 2               # parallel downloads
     embed_cover: bool = True
     js_runtimes: list[str] = field(default_factory=lambda: ["deno", "node"])
@@ -92,13 +104,60 @@ log a warning and fall back to defaults.
 ## ffmpeg.py
 
 ```python
+PROBE_TIMEOUT = 5.0             # `ffmpeg -version` for a copy on PATH / an explicit path
+BUNDLED_PROBE_TIMEOUT = 20.0    # the bundled 100-230 MB static exe on a cold cache / first Defender scan
+
+class ProbeTimeout(Exception)   # raised by _version_of when `-version` does not answer in time
+
 @dataclass
-class FfmpegInfo: path: str | None; version: str | None
+class FfmpegInfo: path: str | None; version: str | None; bundled: bool = False; note: str | None = None
+    # bundled: the package's bin copy was chosen. note: why not the configured copy, e.g.
+    # "ffmpeg_path X does not exist, using the bundled copy" / "... cannot be run, using the one on PATH" /
+    # "-version did not answer within 20 s, assuming it works" (bundled copy only)
+    def describe(self) -> str   # "<path> (<version>)", "<path> (<version>, bundled)", "<path> (version not read, bundled)",
+                                # each followed by "; <note>" when there is one, or "not found"; doctor prints this
 def find_ffmpeg(explicit: str | None = None) -> FfmpegInfo
-    # order: explicit -> shutil.which("ffmpeg") -> optional `imageio_ffmpeg.get_ffmpeg_exe()` (import guarded) -> not found
-    # version: parse first line of `ffmpeg -version` (timeout 5s); any failure -> version None
-def install_hint() -> str   # platform-specific one-liner, Windows: "winget install Gyan.FFmpeg"
+    # order: explicit (only when it exists) -> bundled_tool("ffmpeg") -> shutil.which("ffmpeg") -> optional
+    # `imageio_ffmpeg.get_ffmpeg_exe()` (import guarded) -> not found
+    # a candidate whose `-version` fails (corrupt, blocked) is skipped and the next one is tried; a missing or
+    # broken explicit path leaves a note on the copy that was chosen instead (notes are joined with "; ", so
+    # the timeout note below never replaces it); the bundled copy without its bin\ffprobe.exe gets a note too
+    # the bundled copy gets BUNDLED_PROBE_TIMEOUT and is still reported (version None, note) when it times out:
+    # a slow first start must not paint the doctor line red; a slow copy elsewhere is skipped
+def _version_of(path, timeout=PROBE_TIMEOUT) -> str | None
+    # parse first line of `ffmpeg -version`; OSError / non-timeout failure -> None; timeout -> ProbeTimeout
+    # successful answers are cached per (normcase abspath, st_mtime_ns, st_size): /api/status and the provider's
+    # doctor() probe the same copy once, not twice per call; failures are never cached
+def clear_version_cache() -> None
+def resolve_explicit(path: str) -> str | None
+    # the file a configured ffmpeg_path names: the file itself, <folder>/ffmpeg.exe for a folder, shutil.which
+    # for a bare name; None when there is no such file. find_ffmpeg() and youtube._ffmpeg_location() both use
+    # it, so doctor and yt-dlp always talk about the same copy (yt-dlp finds ffprobe next to a file path too)
+def missing_bundled_hint(display: str, name: str | None = None) -> str | None
+    # frozen build only: "<display> is missing next to UltimatePlaylist.exe (expected at <bin>/<name>.exe).
+    # Extract the whole zip again, or restore the file if your antivirus quarantined it."; None from source.
+    # name=None: "(expected in <bin>)" - several runtimes are acceptable and the zip ships one of them
+def install_hint() -> str   # frozen: missing_bundled_hint("bin\\ffmpeg.exe", "ffmpeg"); from source a platform-specific
+                            # one-liner, Windows: "winget install Gyan.FFmpeg"
 ```
+
+## bundled.py
+
+```python
+ENV_BIN = "ULTIMATE_PLAYLIST_BIN"
+TOOL_NAMES = ("ffmpeg", "ffprobe", "deno", "node")
+def is_frozen() -> bool                 # sys.frozen, set by the PyInstaller bootloader
+def app_dir() -> Path | None            # folder of the frozen exe (sys.executable resolved); None from source
+def bin_dir() -> Path | None            # $ULTIMATE_PLAYLIST_BIN (surrounding quotes/whitespace stripped) when it names a
+                                        # directory (else one WARNING), else <app_dir>/bin when it exists, else None
+def executable_names(name: str) -> tuple[str, ...]  # ("ffmpeg.exe", "ffmpeg") on Windows, ("ffmpeg",) elsewhere
+def bundled_tool(name: str) -> str | None   # bin_dir()/<name>.exe (Windows; bare name second) or bin_dir()/<name>; None when absent
+def bundled_tools() -> dict[str, str]   # the TOOL_NAMES actually present (diagnostics)
+def is_bundled(name: str, path) -> bool # `path` is the bundled copy of `name` (normcase + abspath comparison)
+```
+
+Pure filesystem lookups, no caching, never raises. `ULTIMATE_PLAYLIST_BIN` exists for tests and
+for running from source against a tools folder; tests clear it (autouse fixture in conftest).
 
 ## providers/__init__.py
 
@@ -145,8 +204,15 @@ scrape whole channels in v0.1).
                     {key: EmbedThumbnail, already_have_thumbnail: False}  # only if settings.embed_cover ],
   writethumbnail: settings.embed_cover, noplaylist: True, quiet: True, no_warnings: False, noprogress: True,
   windowsfilenames: True, retries: 3, fragment_retries: 3, overwrites: True, continuedl: False,
-  js_runtimes: {rt: {"path": None} for rt in settings.js_runtimes},
-  ffmpeg_location: settings.ffmpeg_path  (only if set),
+  js_runtimes: {rt: {"path": bundled_tool(RUNTIME_BINARY.get(rt, rt))} for rt in settings.js_runtimes},
+                   # None = yt-dlp looks on PATH; RUNTIME_BINARY = {"quickjs": "qjs"} (yt-dlp's binary name).
+                   # Frozen build: as soon as one configured runtime is bundled, the non-bundled names are
+                   # dropped (yt-dlp ranks Deno over Node regardless of order; a Deno on PATH must not beat
+                   # the bundled node.exe). From source every configured runtime stays.
+  ffmpeg_location: settings.ffmpeg_path when it exists, else the bundled bin *folder* when bundled_tool("ffmpeg")
+                   exists (the folder, so yt-dlp finds the bundled ffprobe next to it), else unset.
+                   A configured path that does not exist is logged once (warning) and ignored: yt-dlp would
+                   otherwise "continue without ffmpeg" and every conversion would fail while doctor is green,
   logger: a small adapter forwarding to logging.getLogger("ultimate_playlist.youtube"),
   progress_hooks: [hook], postprocessor_hooks: [pp_hook]
   ```
@@ -185,11 +251,16 @@ scrape whole channels in v0.1).
 - Errors: `DownloadCancelled` propagates; `yt_dlp.utils.DownloadError` -> `ProviderError(friendly)`;
   anything else -> `ProviderError(f"Download failed: {exc}")`. Always clean up `.incoming/<id>.*`.
 
-`doctor()`: `[ (ffmpeg found?, "ffmpeg", path/version or install_hint()),
-  (js runtime found?, "JavaScript runtime", "node 24.x" / "Install Deno: winget install DenoLand.Deno (or Node.js)"),
+`doctor()`: `[ (ffmpeg found?, "ffmpeg", FfmpegInfo.describe() or install_hint()),
+  (js runtime found?, "JavaScript runtime", "node 24.x (<path>)" / "node 24.x (<path>, bundled)" /
+  "Install Deno: winget install DenoLand.Deno (or Node.js 22+)" from source, or in the frozen build
+  "bin\deno.exe or bin\node.exe is missing next to UltimatePlaylist.exe (expected at ...). Extract the
+  whole zip again, ..." via `ffmpeg.missing_bundled_hint`),
   (True, "yt-dlp", version) ]`. Detect runtimes with
-  `yt_dlp.utils._jsruntime.DenoJsRuntime().info()` / `NodeJsRuntime().info()` guarded by try/except
-  (fall back to `shutil.which("deno"/"node")`).
+`yt_dlp.utils._jsruntime.DenoJsRuntime(path=bundled_tool("deno")).info()` /
+`NodeJsRuntime(path=bundled_tool("node")).info()` guarded by try/except (fall back to
+`bundled_tool(name)`, then `shutil.which("deno"/"node")`); the frozen build probes only the
+runtimes `_ydl_opts` will enable (see js_runtimes above), so doctor and the downloads agree.
 
 Keep every yt-dlp import inside the module (`import yt_dlp`), and keep pure helpers
 (`split_artist_title`, `clean_title`, `safe_filename`, `unique_path`, `pick_artist_title`,
@@ -288,7 +359,8 @@ starts on startup and stops on shutdown (lifespan). Bind to 127.0.0.1 only (in `
 
 Endpoints (JSON; errors as `{"detail": "..."}` with proper 4xx):
 - `GET  /` -> static/index.html. `GET /static/*` -> files.
-- `GET  /api/status` -> `{version, library_dir, providers:[{name, display_name, checks:[{ok,label,detail}]}], ffmpeg:{path,version}, jobs_active:int, tracks:int}`
+- `GET  /api/version` -> `{version}`; no tool probes, no library count (a second UltimatePlaylist.exe asks it to find the running copy).
+- `GET  /api/status` -> `{version, library_dir, providers:[{name, display_name, checks:[{ok,label,detail}]}], ffmpeg:{path,version,bundled}, jobs_active:int, tracks:int}`
 - `GET  /api/settings` -> Settings.to_dict(); `PUT /api/settings` (partial body) -> validates
   `library_dir` (created if missing), `concurrency` 1..6, saves, returns new settings. Changing
   `library_dir` re-points the Library and rescans.
@@ -340,8 +412,24 @@ Structure:
 
 ## cli.py
 
-argparse, `prog="up"`. No subcommand -> `serve`. Subcommands:
-- `serve [--port 8765] [--no-browser] [--host 127.0.0.1]`
+argparse, `prog="up"` from source and the exe's own file name (`UltimatePlaylist.exe`) in the
+frozen build, so `--version`, `--help` and usage errors name a command that exists. No
+subcommand -> `serve`. Subcommands:
+- `serve [--port 8765] [--no-browser] [--host 127.0.0.1]`. In the frozen build it names the
+  console window "Ultimate Playlist", and with the default host and port it first asks
+  `http://127.0.0.1:<port>/api/version` for every port `serve()` could have chosen (8765 and the
+  next ten, `find_running_instance()` / `running_instance()`, 3 s timeout each, a closed port
+  refuses at once; a proxy-free opener, so HTTP_PROXY never captures the probe): an answer
+  carrying our own `version` means a copy is already running (the user double-clicked twice, or
+  a foreign program pushed the first start to 8766), so it prints "Ultimate Playlist is already
+  running at <url> - opening it in your browser." and "This window closes by itself.", opens the
+  browser (unless `--no-browser`), waits `JOIN_PAUSE` (1.5 s, so the line can be read) and exits
+  0 instead of starting a second server on the next port. Anything else on the ports keeps the
+  next-free-port fallback. Then it prints one line for the console window: "Starting Ultimate
+  Playlist... Your browser will open. Close this window to stop." (the browser clause is dropped
+  with `--no-browser`); uvicorn's INFO bookkeeping ("Started server process", "Waiting for
+  application startup", "Uvicorn running on ... (Press CTRL+C to quit)") is kept off the console
+  in the frozen build (`logs.ConsoleFilter`; app.log keeps it).
 - `add URL [URL...] [--no-wait]` : submits, prints progress lines per job, exits 0 if
   all DONE/SKIPPED else 1. Uses JobManager directly (no server).
 - `list [-q QUERY]` : prints tracks as a table (id, artist, title, duration, path).
@@ -353,7 +441,8 @@ argparse, `prog="up"`. No subcommand -> `serve`. Subcommands:
 ## Testing (offline)
 
 - `tests/conftest.py`: fixtures `tmp_settings` (Settings with `library_dir=tmp_path/"lib"` and
-  `ULTIMATE_PLAYLIST_HOME` env pointed at `tmp_path/"home"` via monkeypatch), `fake_provider`
+  `ULTIMATE_PLAYLIST_HOME` env pointed at `tmp_path/"home"` via monkeypatch; `ULTIMATE_PLAYLIST_BIN`
+  is cleared for every test), `fake_provider`
   (see below, registered via `providers.register` and unregistered on teardown), `library`,
   `playlists`, `client` (FastAPI TestClient with a JobManager using the fake provider).
 - `tests/fake_provider.py`: `FakeProvider(name="fake")` matching `https://fake.test/track/<id>` and

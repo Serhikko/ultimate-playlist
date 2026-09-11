@@ -426,6 +426,13 @@ def create_app(
 
     # -- status & settings -------------------------------------------------------------------
 
+    @app.get("/api/version")
+    def version() -> dict[str, str]:
+        """Only the version: no tool probes, no library count. A second UltimatePlaylist.exe
+        asks this to find the running copy (cli.running_instance), so it must answer at once
+        even while the first start is still probing ffmpeg."""
+        return {"version": __version__}
+
     @app.get("/api/status")
     def status() -> dict[str, Any]:
         ffmpeg = find_ffmpeg(settings.ffmpeg_path)
@@ -433,7 +440,11 @@ def create_app(
             "version": __version__,
             "library_dir": str(settings.library_dir),
             "providers": provider_status(settings),
-            "ffmpeg": {"path": ffmpeg.path, "version": ffmpeg.version},
+            "ffmpeg": {
+                "path": ffmpeg.path,
+                "version": ffmpeg.version,
+                "bundled": ffmpeg.bundled,  # the copy in the package's bin folder
+            },
             "jobs_active": jobs.active_count(),
             "tracks": len(library),
         }

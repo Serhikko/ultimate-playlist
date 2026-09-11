@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -23,8 +24,45 @@ def app_data_dir() -> Path:
     return path
 
 
+LIBRARY_FOLDER_NAME = "Ultimate Playlist"
+# FOLDERID_Music: the user's Music library as Explorer shows it. With OneDrive's "Known Folder
+# Move" (the default on many consumer Windows 11 installs) that is C:\Users\<you>\OneDrive\Music,
+# not ~/Music; a library created under ~/Music would never show up under "Music" in Explorer.
+_FOLDERID_MUSIC = "{4BD688B7-F18E-4E6C-A72F-8B8F2B53EDE7}"
+
+
+def _known_folder(folder_id: str) -> Path | None:
+    """SHGetKnownFolderPath(folder_id) on Windows, None anywhere else or on any failure."""
+    if not sys.platform.startswith("win"):
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        shell32 = ctypes.windll.shell32  # type: ignore[attr-defined]
+        ole32 = ctypes.windll.ole32  # type: ignore[attr-defined]
+        guid = ctypes.create_string_buffer(16)
+        if ole32.CLSIDFromString(folder_id, guid) != 0:
+            return None
+        out = ctypes.c_wchar_p()
+        if shell32.SHGetKnownFolderPath(guid, 0, None, ctypes.byref(out)) != 0 or not out.value:
+            return None
+        try:
+            return Path(out.value)
+        finally:
+            ole32.CoTaskMemFree(ctypes.cast(out, wintypes.LPVOID))
+    except Exception as exc:  # noqa: BLE001 - any shell hiccup means "use ~/Music"
+        log.debug("SHGetKnownFolderPath failed: %s", exc)
+        return None
+
+
+def music_dir() -> Path:
+    """The user's Music folder: the Windows known folder when available, else ``~/Music``."""
+    return _known_folder(_FOLDERID_MUSIC) or Path.home() / "Music"
+
+
 def _default_library_dir() -> Path:
-    return Path.home() / "Music" / "Ultimate Playlist"
+    return music_dir() / LIBRARY_FOLDER_NAME
 
 
 def _expand(p: str | os.PathLike[str]) -> Path:

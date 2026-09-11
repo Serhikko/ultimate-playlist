@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import sys
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import mutagen
@@ -12,7 +14,10 @@ import yt_dlp.utils
 from fake_provider import FAKE_PNG, write_tiny_audio
 from mutagen.id3 import APIC, ID3, TXXX
 
+from ultimate_playlist import ffmpeg as ffmpeg_mod
+from ultimate_playlist.bundled import ENV_BIN
 from ultimate_playlist.config import Settings
+from ultimate_playlist.ffmpeg import FfmpegInfo
 from ultimate_playlist.library import read_tags
 from ultimate_playlist.models import JobStatus, ProgressEvent, TrackRef
 from ultimate_playlist.providers import youtube
@@ -552,6 +557,7 @@ def test_ydl_opts_contents(tmp_path: Path) -> None:
 
 def test_ydl_opts_without_cover_and_with_ffmpeg_path(tmp_path: Path) -> None:
     ffmpeg = tmp_path / "ffmpeg.exe"
+    ffmpeg.write_bytes(b"stub")  # only a path that exists is handed to yt-dlp
     settings = make_settings(
         tmp_path, embed_cover=False, ffmpeg_path=str(ffmpeg), js_runtimes=["node"]
     )
@@ -560,6 +566,75 @@ def test_ydl_opts_without_cover_and_with_ffmpeg_path(tmp_path: Path) -> None:
     assert opts["writethumbnail"] is False
     assert opts["ffmpeg_location"] == str(ffmpeg)
     assert opts["js_runtimes"] == {"node": {"path": None}}
+
+
+def test_ydl_opts_ignores_a_missing_ffmpeg_path(
+    tmp_path: Path, bundled_bin: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A stale ffmpeg_path from an uninstalled ffmpeg must not be forwarded: yt-dlp would then
+    'continue without ffmpeg' while doctor happily reports the bundled copy."""
+    missing = str(tmp_path / "nope" / "ffmpeg.exe")
+    youtube._warned_ffmpeg_paths.clear()
+    settings = make_settings(tmp_path, ffmpeg_path=missing)
+    with caplog.at_level("WARNING", logger="ultimate_playlist.providers.youtube"):
+        opts = _ydl_opts(settings, tmp_path, lambda _e: None, threading.Event())
+        assert opts["ffmpeg_location"] == str(bundled_bin)  # the bundled folder, as doctor says
+        (bundled_bin / f"ffmpeg{EXE}").unlink()
+        opts = _ydl_opts(settings, tmp_path, lambda _e: None, threading.Event())
+        assert "ffmpeg_location" not in opts  # nothing bundled either: yt-dlp searches PATH
+    assert sum("does not exist" in r.getMessage() for r in caplog.records) == 1  # warned once
+    youtube._warned_ffmpeg_paths.clear()
+
+
+@pytest.fixture
+def any_file_is_ffmpeg(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stub named ffmpeg.exe cannot run; count every existing file as version 'stub'."""
+    ffmpeg_mod.clear_version_cache()
+    monkeypatch.setattr(
+        ffmpeg_mod,
+        "_version_of",
+        lambda path, timeout=None: "stub" if Path(path).is_file() else None,
+    )
+
+
+def test_folder_ffmpeg_path_means_the_same_file_for_doctor_and_yt_dlp(
+    tmp_path: Path, bundled_bin: Path, any_file_is_ffmpeg: None
+) -> None:
+    """ffmpeg_path pasted from Explorer names the folder; yt-dlp accepts a folder, so doctor
+    must resolve it to the same ffmpeg.exe instead of calling the setting broken."""
+    folder = tmp_path / "my bin"
+    folder.mkdir()
+    inside = folder / f"ffmpeg{EXE}"
+    inside.write_bytes(b"stub")
+    settings = make_settings(tmp_path, ffmpeg_path=str(folder))
+    opts = _ydl_opts(settings, tmp_path, lambda _e: None, threading.Event())
+    assert opts["ffmpeg_location"] == str(inside)
+    info = ffmpeg_mod.find_ffmpeg(settings.ffmpeg_path)  # the real one, not the conftest stub
+    assert info.path == str(inside) and info.note is None and info.bundled is False
+    # the folder without ffmpeg in it: both fall back to the bundled folder, doctor says why
+    inside.unlink()
+    youtube._warned_ffmpeg_paths.clear()
+    opts = _ydl_opts(settings, tmp_path, lambda _e: None, threading.Event())
+    assert opts["ffmpeg_location"] == str(bundled_bin)
+    info = ffmpeg_mod.find_ffmpeg(settings.ffmpeg_path)
+    assert info.bundled is True and info.note.startswith(f"ffmpeg_path {folder} is a folder")
+    youtube._warned_ffmpeg_paths.clear()
+
+
+def test_bare_ffmpeg_name_means_the_path_copy_for_doctor_and_yt_dlp(
+    tmp_path: Path, bundled_bin: Path, any_file_is_ffmpeg: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    on_path = tmp_path / "onpath"
+    on_path.mkdir()
+    exe = on_path / f"ffmpeg{EXE}"
+    exe.write_bytes(b"stub")
+    monkeypatch.setenv("PATH", str(on_path))
+    monkeypatch.setenv("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+    settings = make_settings(tmp_path, ffmpeg_path="ffmpeg")
+    opts = _ydl_opts(settings, tmp_path, lambda _e: None, threading.Event())
+    assert Path(opts["ffmpeg_location"]).resolve() == exe.resolve()
+    info = ffmpeg_mod.find_ffmpeg("ffmpeg")
+    assert Path(info.path).resolve() == exe.resolve() and info.note is None
 
 
 def test_ydl_opts_empty_js_runtimes_falls_back_to_defaults(tmp_path: Path) -> None:
@@ -1567,3 +1642,257 @@ def test_doctor_survives_broken_checks(monkeypatch: pytest.MonkeyPatch) -> None:
     assert checks[0][0] is False and "kaput" in checks[0][2]
     assert checks[1][0] is False and "kaput" in checks[1][2]
     assert checks[2][0] is True
+
+
+# ----------------------------------------------------------------------------------------------
+# bundled tools: the no-install package ships ffmpeg / ffprobe / a JS runtime in <app>/bin
+# ----------------------------------------------------------------------------------------------
+
+EXE = ".exe" if sys.platform.startswith("win") else ""
+
+
+@pytest.fixture(autouse=True)
+def no_bundled_folder(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test above describes a source checkout: no bundled bin folder unless requested."""
+    monkeypatch.delenv(ENV_BIN, raising=False)
+
+
+@pytest.fixture
+def bundled_bin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A bin folder holding ffmpeg, ffprobe and node (stub files; nothing is executed)."""
+    folder = tmp_path / "bundled-bin"
+    folder.mkdir()
+    for name in ("ffmpeg", "ffprobe", "node"):
+        (folder / f"{name}{EXE}").write_bytes(b"stub")
+    monkeypatch.setenv(ENV_BIN, str(folder))
+    return folder
+
+
+def test_js_runtimes_opt_pins_bundled_runtimes(bundled_bin: Path) -> None:
+    node = str(bundled_bin / f"node{EXE}")
+    assert youtube._js_runtimes_opt(["deno", "node"]) == {
+        "deno": {"path": None},  # not shipped: yt-dlp looks on PATH as before
+        "node": {"path": node},
+    }
+    assert youtube._js_runtimes_opt(None)["node"] == {"path": node}
+
+
+def test_ydl_opts_point_ffmpeg_location_at_the_bundled_folder(
+    bundled_bin: Path, tmp_path: Path
+) -> None:
+    opts = _ydl_opts(make_settings(tmp_path), tmp_path, lambda _e: None, threading.Event())
+    assert opts["ffmpeg_location"] == str(bundled_bin)  # the folder: ffprobe is found there too
+    assert opts["js_runtimes"]["node"] == {"path": str(bundled_bin / f"node{EXE}")}
+
+
+def test_ydl_opts_explicit_ffmpeg_path_beats_the_bundled_one(
+    bundled_bin: Path, tmp_path: Path
+) -> None:
+    explicit = tmp_path / "custom" / "ffmpeg.exe"
+    explicit.parent.mkdir()
+    explicit.write_bytes(b"stub")  # it must exist: a stale path falls back to the bundled folder
+    settings = make_settings(tmp_path, ffmpeg_path=str(explicit))
+    opts = _ydl_opts(settings, tmp_path, lambda _e: None, threading.Event())
+    assert opts["ffmpeg_location"] == str(explicit)
+
+
+def test_ydl_opts_without_bundled_ffmpeg_set_no_ffmpeg_location(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    folder = tmp_path / "bundled-bin"
+    folder.mkdir()
+    (folder / f"node{EXE}").write_bytes(b"stub")
+    monkeypatch.setenv(ENV_BIN, str(folder))
+    opts = _ydl_opts(make_settings(tmp_path), tmp_path, lambda _e: None, threading.Event())
+    assert "ffmpeg_location" not in opts
+    assert opts["js_runtimes"]["node"] == {"path": str(folder / f"node{EXE}")}
+
+
+def test_bundled_ydl_opts_are_accepted_by_real_youtubedl(bundled_bin: Path, tmp_path: Path) -> None:
+    opts = _ydl_opts(
+        make_settings(tmp_path), tmp_path / ".incoming", lambda _e: None, threading.Event()
+    )
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        assert ydl.params["ffmpeg_location"] == str(bundled_bin)
+        assert ydl.params["js_runtimes"]["node"] == {"path": str(bundled_bin / f"node{EXE}")}
+
+
+def test_resolve_passes_bundled_runtime_paths(
+    fake_ydl: type[FakeYoutubeDL], bundled_bin: Path, tmp_path: Path
+) -> None:
+    fake_ydl.result = {"id": "jNQXAC9IVRw", "title": "t"}
+    YouTubeProvider(make_settings(tmp_path)).resolve("https://youtu.be/jNQXAC9IVRw")
+    assert fake_ydl.instances[-1].opts["js_runtimes"] == {
+        "deno": {"path": None},
+        "node": {"path": str(bundled_bin / f"node{EXE}")},
+    }
+
+
+@pytest.mark.real_tools  # the conftest stub replaces _runtime_info itself; exercise the real one
+def test_runtime_info_constructs_the_probe_with_the_bundled_path(
+    bundled_bin: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from yt_dlp.utils import _jsruntime
+
+    constructed: list[str | None] = []
+
+    class FakeRuntime:  # JsRuntime.__init__(self, path=None); `info` is a cached_property
+        def __init__(self, path: str | None = None) -> None:
+            constructed.append(path)
+            self.info = SimpleNamespace(
+                name="x", path=path or "on-path", version="1.0", supported=True
+            )
+
+    monkeypatch.setattr(_jsruntime, "NodeJsRuntime", FakeRuntime)
+    monkeypatch.setattr(_jsruntime, "DenoJsRuntime", FakeRuntime)
+    node = str(bundled_bin / f"node{EXE}")
+    assert youtube._runtime_info("node").path == node
+    assert youtube._runtime_info("deno").path == "on-path"
+    assert constructed == [node, None]
+
+
+def freeze(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Pretend PyInstaller started us from <tmp>/app/UltimatePlaylist.exe."""
+    app = tmp_path / "app"
+    app.mkdir(exist_ok=True)
+    exe = app / "UltimatePlaylist.exe"
+    exe.write_bytes(b"stub")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(exe))
+    return app
+
+
+def test_frozen_build_enables_only_the_bundled_runtimes(
+    bundled_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """yt-dlp ranks Deno above Node whatever the order; a Deno on PATH must not beat bin/node.exe."""
+    node = str(bundled_bin / f"node{EXE}")
+    Path(node).write_bytes(b"stub")
+    both = {"deno": {"path": None}, "node": {"path": node}}
+    assert youtube._js_runtimes_opt(["deno", "node"]) == both  # from source: as before
+    freeze(tmp_path, monkeypatch)
+    assert youtube._js_runtimes_opt(["deno", "node"]) == {"node": {"path": node}}
+    Path(node).unlink()  # nothing bundled: every configured runtime stays enabled
+    assert youtube._js_runtimes_opt(["deno", "node"]) == {
+        "deno": {"path": None},
+        "node": {"path": None},
+    }
+
+
+def test_quickjs_is_looked_up_as_qjs(bundled_bin: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    qjs = bundled_bin / f"qjs{EXE}"
+    qjs.write_bytes(b"stub")
+    assert youtube._js_runtimes_opt(["quickjs", "deno"]) == {
+        "quickjs": {"path": str(qjs)},
+        "deno": {"path": None},
+    }
+    # doctor tags it as bundled too (the runtime key is quickjs, the shipped file is qjs.exe)
+    info = SimpleNamespace(name="quickjs", path=str(qjs), version="0.10.0", supported=True)
+    monkeypatch.setattr(youtube, "_runtime_info", lambda name: info if name == "quickjs" else None)
+    assert youtube._js_runtime_check(["quickjs"]) == (True, f"quickjs 0.10.0 ({qjs}, bundled)")
+
+
+def test_frozen_js_runtime_hint_says_re_extract(
+    bundled_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (bundled_bin / f"node{EXE}").unlink()  # a bin folder with the runtime missing (quarantined)
+    monkeypatch.setattr(youtube, "_runtime_info", lambda name: None)
+    monkeypatch.setattr(youtube.shutil, "which", lambda name: None)
+    ok, detail = youtube._js_runtime_check(["deno", "node"])
+    assert ok is False and "winget" in detail  # from source: install advice
+    freeze(tmp_path, monkeypatch)
+    ok, detail = youtube._js_runtime_check(["deno", "node"])
+    assert ok is False
+    assert detail.startswith(
+        "bin\\deno.exe or bin\\node.exe is missing next to UltimatePlaylist.exe"
+    )
+    # nothing is left in bin/, so the zip may have carried either: point at the folder, not at
+    # deno.exe (a build around node.exe never contained it)
+    assert f"(expected in {bundled_bin})" in detail and "expected at" not in detail
+    assert "Extract the whole zip again" in detail
+    assert "winget" not in detail
+    checks = YouTubeProvider(make_settings(tmp_path)).doctor()
+    assert checks[1] == (False, "JavaScript runtime", detail)
+
+
+def test_frozen_js_runtime_hint_names_the_runtime_that_shipped(
+    bundled_bin: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A zip built around node.exe must talk about bin\\node.exe, never about deno.exe."""
+    freeze(tmp_path, monkeypatch)
+    hint = youtube._js_runtime_hint(["deno", "node"])
+    assert hint.startswith("bin\\node.exe is missing next to UltimatePlaylist.exe")
+    assert f"(expected at {bundled_bin / f'node{EXE}'})" in hint
+    assert "deno" not in hint
+    assert youtube._js_runtime_hint(["deno"]) == hint  # the configured names do not matter
+
+
+def test_frozen_build_with_unbundled_js_runtimes_uses_the_shipped_one(
+    bundled_bin: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """config.json says ["deno"] but the zip ships node.exe: use node (a PATH lookup for deno
+    finds nothing on a clean machine) and say so once, instead of failing every download and
+    telling the user to re-extract a zip that never contained deno.exe."""
+    node = str(bundled_bin / f"node{EXE}")
+    assert youtube._js_runtimes_opt(["deno"]) == {"deno": {"path": None}}  # from source: as is
+    freeze(tmp_path, monkeypatch)
+    youtube._warned_unbundled_runtimes.clear()
+    with caplog.at_level("WARNING", logger="ultimate_playlist.providers.youtube"):
+        assert youtube._js_runtimes_opt(["deno"]) == {"node": {"path": node}}
+        assert youtube._js_runtimes_opt(["deno"]) == {"node": {"path": node}}
+        assert youtube._js_runtimes_opt(["bun", "quickjs"]) == {"node": {"path": node}}
+    warnings = [r.getMessage() for r in caplog.records if "not bundled" in r.getMessage()]
+    assert warnings == [
+        "js_runtimes ['deno'] not bundled; using the packaged node",
+        "js_runtimes ['bun', 'quickjs'] not bundled; using the packaged node",
+    ]
+    settings = make_settings(tmp_path, js_runtimes=["deno"])
+    opts = _ydl_opts(settings, tmp_path, lambda _e: None, threading.Event())
+    assert opts["js_runtimes"] == {"node": {"path": node}}
+    info = SimpleNamespace(name="node", path=node, version="24.1.0", supported=True)
+    monkeypatch.setattr(youtube, "_runtime_info", lambda name: info if name == "node" else None)
+    assert YouTubeProvider(settings).doctor()[1] == (
+        True,
+        "JavaScript runtime",
+        f"node 24.1.0 ({node}, bundled)",
+    )
+    Path(node).unlink()  # nothing shipped at all: the configured names stay, PATH lookup
+    assert youtube._js_runtimes_opt(["deno"]) == {"deno": {"path": None}}
+    youtube._warned_unbundled_runtimes.clear()
+
+
+def test_js_runtime_check_says_bundled(bundled_bin: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    node = str(bundled_bin / f"node{EXE}")
+    info = SimpleNamespace(name="node", path=node, version="24.1.0", supported=True)
+    monkeypatch.setattr(youtube, "_runtime_info", lambda name: info if name == "node" else None)
+    assert youtube._js_runtime_check(["deno", "node"]) == (True, f"node 24.1.0 ({node}, bundled)")
+
+    info.path = "C:/nodejs/node.exe"  # the same tool found elsewhere is not "bundled"
+    assert youtube._js_runtime_check(["node"]) == (True, "node 24.1.0 (C:/nodejs/node.exe)")
+
+
+def test_js_runtime_check_fallback_prefers_the_bundled_copy(
+    bundled_bin: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(youtube, "_runtime_info", lambda name: None)
+    monkeypatch.setattr(
+        youtube.shutil, "which", lambda name: "/usr/bin/node" if name == "node" else None
+    )
+    node = str(bundled_bin / f"node{EXE}")
+    assert youtube._js_runtime_check(["deno", "node"]) == (True, f"node ({node}, bundled)")
+
+
+def test_doctor_mentions_bundled_tools(bundled_bin: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ffmpeg = str(bundled_bin / f"ffmpeg{EXE}")
+    node = str(bundled_bin / f"node{EXE}")
+    monkeypatch.setattr(
+        youtube, "find_ffmpeg", lambda explicit=None: FfmpegInfo(ffmpeg, "8.1.1", bundled=True)
+    )
+    info = SimpleNamespace(name="node", path=node, version="24.1.0", supported=True)
+    monkeypatch.setattr(youtube, "_runtime_info", lambda name: info if name == "node" else None)
+    checks = YouTubeProvider().doctor()
+    assert checks[0] == (True, "ffmpeg", f"{ffmpeg} (8.1.1, bundled)")
+    assert checks[1] == (True, "JavaScript runtime", f"node 24.1.0 ({node}, bundled)")

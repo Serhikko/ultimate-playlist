@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
+import time
+import urllib.error
+import urllib.request
+import webbrowser
 from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .bundled import is_frozen
 from .config import Settings, app_data_dir
 from .ffmpeg import find_ffmpeg, install_hint
 from .library import Library, LibraryUnavailable
@@ -23,8 +29,18 @@ OK_MARK = "✓"
 BAD_MARK = "✗"
 DEFAULT_PORT = 8765
 DEFAULT_HOST = "127.0.0.1"
+# The ports serve() may end up on: the requested one plus the next ten. Kept equal to
+# server.app.PORT_ATTEMPTS (test_cli guards that) instead of imported, so the CLI does not load
+# FastAPI for `up list`.
+PORT_ATTEMPTS = 11
+JOIN_TIMEOUT = 3.0  # seconds to wait for /api/version; a closed port refuses at once
+JOIN_PAUSE = 1.5  # seconds the "already running" line stays readable before the window closes
 POLL_INTERVAL = 0.2  # seconds between progress checks in `add`
 EXIT_OK, EXIT_FAILURE, EXIT_INTERRUPTED = 0, 1, 130
+
+# A loopback probe must never go through HTTP_PROXY (set on corporate machines, usually without
+# NO_PROXY=127.0.0.1): the default opener would send it to the proxy, which cannot answer.
+_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 # -- small helpers -----------------------------------------------------------------------------
@@ -120,10 +136,69 @@ def find_playlist(playlists: Sequence[Playlist], name_or_id: str) -> Playlist:
 # -- commands ----------------------------------------------------------------------------------
 
 
+def running_instance(host: str, port: int, timeout: float = JOIN_TIMEOUT) -> str | None:
+    """URL of an Ultimate Playlist of this version already serving on host:port, else None.
+
+    Only a `/api/version` that answers with our own version counts: a foreign program on the
+    port is left alone (the caller then falls back to the next free port, as before). That
+    endpoint does no work (no ffmpeg probe, no library count), so a copy that is still busy
+    with its first `/api/status` answers it at once.
+    """
+    url = f"http://{host}:{port}/"
+    try:
+        with _opener.open(url + "api/version", timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError):  # connection refused, timeout, not JSON: nothing of ours
+        return None
+    return url if isinstance(data, dict) and data.get("version") == __version__ else None
+
+
+def find_running_instance(host: str, port: int, attempts: int = PORT_ATTEMPTS) -> str | None:
+    """The running copy on any port serve() could have chosen: `port` or the next free ones.
+
+    When a foreign program holds 8765 the first double-click serves on 8766; the second must
+    find it there instead of starting a third server. A closed port refuses the connection in
+    milliseconds, so the scan costs nothing on a normal start.
+    """
+    for candidate in range(port, port + attempts):
+        url = running_instance(host, candidate)
+        if url:
+            return url
+    return None
+
+
+def _set_console_title(title: str) -> None:
+    """Name the console window (Task Manager and the taskbar show the exe path otherwise)."""
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.kernel32.SetConsoleTitleW(title)  # type: ignore[attr-defined]
+    except Exception as exc:  # noqa: BLE001 - cosmetic; never block the start
+        log.debug("Could not set the console title: %s", exc)
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     from .server.app import serve
 
     settings = load_settings(args.library)
+    if is_frozen():  # the packaged exe: a console window that must explain itself
+        _set_console_title("Ultimate Playlist")
+        # A second double-click (the browser was slow to appear) must not start a second server
+        # with its own queue on the next port; join the running one instead.
+        if args.port == DEFAULT_PORT and args.host == DEFAULT_HOST:
+            url = find_running_instance(args.host, args.port)
+            if url:
+                opening = "" if args.no_browser else " - opening it in your browser"
+                say(f"Ultimate Playlist is already running at {url}{opening}.")
+                say("This window closes by itself.")
+                if not args.no_browser:
+                    webbrowser.open(url)
+                time.sleep(JOIN_PAUSE)  # long enough to read the line above
+                return EXIT_OK
+        browser = "" if args.no_browser else " Your browser will open."
+        say(f"Starting Ultimate Playlist...{browser} Close this window to stop.")
     try:
         serve(settings, host=args.host, port=args.port, open_browser=not args.no_browser)
     except OSError as exc:
@@ -238,7 +313,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     say(f"Library:   {settings.library_dir} ({exists})")
     ffmpeg = find_ffmpeg(settings.ffmpeg_path)
     if ffmpeg.found:
-        ffmpeg_line = (True, f"{ffmpeg.path} ({ffmpeg.version})")
+        ffmpeg_line = (True, ffmpeg.describe())
     else:
         ffmpeg_line = (False, install_hint())
     say(f"{OK_MARK if ffmpeg_line[0] else BAD_MARK} ffmpeg: {ffmpeg_line[1]}")
@@ -329,9 +404,14 @@ def cmd_export(args: argparse.Namespace) -> int:
 # -- parser ------------------------------------------------------------------------------------
 
 
+def prog_name() -> str:
+    """`up` from source; the exe's own file name in the packaged build (there is no `up` there)."""
+    return Path(sys.executable).name if is_frozen() else "up"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="up",
+        prog=prog_name(),
         description="Ultimate Playlist: paste links, get tagged MP3s, build playlists.",
         epilog="Run without a subcommand to start the web app.",
     )

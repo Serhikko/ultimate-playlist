@@ -17,6 +17,9 @@ ultimate-playlist = "ultimate_playlist.cli:main"
 up = "ultimate_playlist.cli:main"
 
 [dependency-groups]
+build = [
+    "pyinstaller>=6.22.2",
+]
 dev = [
     "pytest>=8",
     "httpx>=0.27",

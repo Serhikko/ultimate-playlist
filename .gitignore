@@ -1,10 +1,13 @@
 .venv/
+.venv-build/
 __pycache__/
 *.pyc
 .pytest_cache/
 .ruff_cache/
-dist/
-build/
+# PyInstaller output (scripts/build_windows.py). The spec in packaging/ is committed on
+# purpose, so never add *.spec here.
+/dist/
+/build/
 *.egg-info/
 .env
 # downloaded media never belongs in the repo
