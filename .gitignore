@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+.env
+# downloaded media never belongs in the repo
+*.mp3
+*.m4a
+*.webm
+*.part
+*.ytdl
