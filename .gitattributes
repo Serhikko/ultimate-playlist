@@ -1,0 +1,20 @@
+# Normalise line endings: LF in the repository and on checkout, on every platform.
+# Python, JSON, YAML, HTML, CSS and JS are all happy with LF on Windows.
+* text=auto eol=lf
+
+# Binary assets: never convert line endings, never text-diff.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.webp  binary
+*.woff  binary
+*.woff2 binary
+*.mp3   binary
+*.m4a   binary
+*.opus  binary
+*.flac  binary
+*.ogg   binary
+*.wav   binary
+*.webm  binary

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import threading
+from typing import TYPE_CHECKING
 
 from .base import (
     DownloadCancelled,
@@ -12,17 +14,22 @@ from .base import (
     ProviderNotAvailable,
 )
 
+if TYPE_CHECKING:
+    from ..config import Settings
+
 __all__ = [
     "PROVIDERS",
     "DownloadCancelled",
     "Provider",
     "ProviderError",
     "ProviderNotAvailable",
+    "configure",
     "doctor_all",
     "get_provider",
     "normalize_url",
     "provider_by_name",
     "register",
+    "run_doctor",
     "unregister",
 ]
 
@@ -92,14 +99,52 @@ def provider_by_name(name: str) -> Provider | None:
     return None
 
 
-def doctor_all() -> dict[str, list[tuple[bool, str, str]]]:
+def configure(settings: Settings) -> None:
+    """Hand the live settings to every provider that wants them (``configure(settings)``).
+
+    Providers are constructed without settings by `_load_builtin`; the app and the CLI call this
+    once so `resolve()`/`doctor()` honour config.json (ffmpeg_path, js_runtimes, ...).
+    """
+    with _lock:
+        for provider in PROVIDERS:
+            hook = getattr(provider, "configure", None)
+            if not callable(hook):
+                continue
+            try:
+                hook(settings)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("%s.configure() failed: %s", provider.name, exc)
+
+
+def _accepts_argument(func: object) -> bool:
+    try:
+        params = inspect.signature(func).parameters.values()  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    positional = (
+        inspect.Parameter.POSITIONAL_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.VAR_POSITIONAL,
+    )
+    return any(p.kind in positional for p in params)
+
+
+def run_doctor(provider: Provider, settings: Settings | None = None) -> list[tuple[bool, str, str]]:
+    """`provider.doctor()`, passing `settings` when the provider accepts one. Never raises."""
+    try:
+        if settings is not None and _accepts_argument(provider.doctor):
+            return list(provider.doctor(settings))  # type: ignore[call-arg]
+        return list(provider.doctor())
+    except Exception as exc:  # noqa: BLE001
+        display = getattr(provider, "display_name", provider.name)
+        return [(False, display, f"doctor() failed: {exc}")]
+
+
+def doctor_all(settings: Settings | None = None) -> dict[str, list[tuple[bool, str, str]]]:
     result: dict[str, list[tuple[bool, str, str]]] = {}
     with _lock:
         for provider in PROVIDERS:
-            try:
-                result[provider.name] = list(provider.doctor())
-            except Exception as exc:  # noqa: BLE001
-                result[provider.name] = [(False, provider.display_name, f"doctor() failed: {exc}")]
+            result[provider.name] = run_doctor(provider, settings)
     return result
 
 

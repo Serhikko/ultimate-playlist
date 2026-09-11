@@ -36,6 +36,9 @@ target-version = "py311"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "real_tools: run the real ffmpeg / JavaScript runtime detection instead of the stubs",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "PERF"]
