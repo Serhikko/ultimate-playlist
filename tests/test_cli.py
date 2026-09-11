@@ -31,11 +31,14 @@ def test_version(capsys: pytest.CaptureFixture[str]) -> None:
 
 
 def test_frozen_exe_uses_its_own_name(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """There is no `up` in the zip: usage and errors must say UltimatePlaylist.exe."""
     monkeypatch.setattr(cli, "is_frozen", lambda: True)
-    monkeypatch.setattr(sys, "executable", r"D:\Apps\UltimatePlaylist\UltimatePlaylist.exe")
+    # A native path: a hard-coded Windows path has no separators on Linux, so `.name` would be
+    # the whole string there.
+    exe = tmp_path / "Apps" / "UltimatePlaylist" / "UltimatePlaylist.exe"
+    monkeypatch.setattr(sys, "executable", str(exe))
     assert cli.main(["--version"]) == 0
     assert capsys.readouterr().out.strip() == f"UltimatePlaylist.exe {__version__}"
     assert cli.main(["bogus"]) == 2

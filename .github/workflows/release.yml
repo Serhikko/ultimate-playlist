@@ -25,8 +25,6 @@ jobs:
       run:
         shell: bash
     env:
-      # Never let the build or the smoke test touch the runner's profile.
-      ULTIMATE_PLAYLIST_HOME: ${{ runner.temp }}/up-home
       SMOKE_PORT: "8791"
     steps:
       - uses: actions/checkout@v4
@@ -51,6 +49,9 @@ jobs:
           fi
 
       - name: Build the package (downloads the official ffmpeg and Deno builds, checksummed)
+        env:
+          # Never let the build or the smoke test touch the runner's profile.
+          ULTIMATE_PLAYLIST_HOME: ${{ runner.temp }}/up-home
         run: |
           suffix=""
           if [ "${{ github.event_name }}" != "push" ]; then
@@ -60,6 +61,9 @@ jobs:
           uv run python scripts/build_windows.py --ffmpeg download --js-runtime download --version-suffix="$suffix"
 
       - name: Smoke test the frozen app (version, doctor)
+        env:
+          # Never let the build or the smoke test touch the runner's profile.
+          ULTIMATE_PLAYLIST_HOME: ${{ runner.temp }}/up-home
         run: |
           mkdir -p "$ULTIMATE_PLAYLIST_HOME"
           dist/UltimatePlaylist/UltimatePlaylist.exe --version
@@ -68,6 +72,9 @@ jobs:
           ls -la dist/*.zip
 
       - name: "Smoke test the frozen app (serve: the web UI must be in the bundle)"
+        env:
+          # Never let the build or the smoke test touch the runner's profile.
+          ULTIMATE_PLAYLIST_HOME: ${{ runner.temp }}/up-home
         # The exe is a background process: without the trap a failed check would leave it
         # running and the step would hang until the job timeout with nothing in the log.
         timeout-minutes: 10

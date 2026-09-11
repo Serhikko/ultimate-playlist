@@ -628,6 +628,7 @@ def test_bare_ffmpeg_name_means_the_path_copy_for_doctor_and_yt_dlp(
     on_path.mkdir()
     exe = on_path / f"ffmpeg{EXE}"
     exe.write_bytes(b"stub")
+    exe.chmod(0o755)  # shutil.which() on Linux/macOS only returns executable files
     monkeypatch.setenv("PATH", str(on_path))
     monkeypatch.setenv("PATHEXT", ".COM;.EXE;.BAT;.CMD")
     settings = make_settings(tmp_path, ffmpeg_path="ffmpeg")
