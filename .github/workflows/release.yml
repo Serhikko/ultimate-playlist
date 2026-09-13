@@ -27,9 +27,9 @@ jobs:
     env:
       SMOKE_PORT: "8791"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v10
         with:
           enable-cache: true
           # The interpreter the app ships on (the same one the test matrix in ci.yml and
@@ -92,7 +92,7 @@ jobs:
           curl -fsS "http://127.0.0.1:${SMOKE_PORT}/api/status"
           echo
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: UltimatePlaylist-windows-x64
           path: dist/*.zip
