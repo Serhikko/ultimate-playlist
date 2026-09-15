@@ -32,6 +32,25 @@ def test_routine_access_lines_are_dropped_but_errors_kept() -> None:
     assert flt.filter(_record("ultimate_playlist.library", "Picked up a file"))
 
 
+def test_the_spotify_login_code_never_reaches_an_access_line() -> None:
+    """A callback that fails (400) is logged, but without its query string (state and code)."""
+    flt = logs.RoutineAccessFilter()
+    fmt = '%s - "%s %s HTTP/%s" %d'
+    callback = "/api/spotify/callback?state=x&code=SECRETCODE1234567890"
+    failed = _record("uvicorn.access", fmt, ("127.0.0.1:1", "GET", callback, "1.1", 400))
+    assert flt.filter(failed)
+    assert "SECRETCODE" not in failed.getMessage() and "state=x" not in failed.getMessage()
+    assert '"GET /api/spotify/callback?[hidden] HTTP/1.1" 400' in failed.getMessage()
+    other = _record("uvicorn.access", fmt, ("127.0.0.1:1", "GET", "/api/x?q=daft", "1.1", 404))
+    assert flt.filter(other) and "/api/x?q=daft" in other.getMessage()
+
+
+def test_secret_query_paths_follow_the_spotify_callback() -> None:
+    from ultimate_playlist.providers import spotify_auth
+
+    assert spotify_auth.CALLBACK_PATH in logs.SECRET_QUERY_PATHS
+
+
 def test_console_filter_hides_ytdlp_chatter_only() -> None:
     flt = logs.ConsoleFilter()
     assert not flt.filter(

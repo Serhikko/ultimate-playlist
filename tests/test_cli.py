@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import io
+import json
 import logging
 import subprocess
 import sys
+import time
+import urllib.error
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fake_provider import FakeProvider, playlist_url, track_url, write_tiny_mp3
 
 from ultimate_playlist import __version__, cli, logs
-from ultimate_playlist.config import Settings
+from ultimate_playlist.config import Settings, app_data_dir
 from ultimate_playlist.ffmpeg import FfmpegInfo
 from ultimate_playlist.library import Library
 from ultimate_playlist.playlists import PlaylistStore
@@ -20,6 +25,24 @@ from ultimate_playlist.playlists import PlaylistStore
 def run(*args: str, library: Path | None = None) -> int:
     argv = ["--library", str(library), *args] if library is not None else list(args)
     return cli.main(argv)
+
+
+@pytest.fixture(autouse=True)
+def no_real_app_is_ever_contacted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A copy of the app may really be running on this machine: no test may find it, let
+    alone change its settings. Every loopback request the CLI makes is refused instead; the
+    tests that need a "running app" fake the probe and the call themselves."""
+
+    def refused(*args: object, **kwargs: object) -> None:
+        raise urllib.error.URLError(ConnectionRefusedError("connection refused"))
+
+    monkeypatch.setattr(cli._opener, "open", refused)
+
+
+def pretend_running(monkeypatch: pytest.MonkeyPatch, url: str | None) -> None:
+    monkeypatch.setattr(
+        cli, "find_running_instance", lambda host, port, attempts=cli.PORT_ATTEMPTS: url
+    )
 
 
 # -- global options ----------------------------------------------------------------------------
@@ -573,7 +596,7 @@ def test_doctor_with_missing_ffmpeg(
 # -- config ------------------------------------------------------------------------------------
 
 
-def test_config_show_masks_the_secret(
+def test_config_show_lists_every_setting(
     tmp_settings: Settings, capsys: pytest.CaptureFixture[str]
 ) -> None:
     assert run("config", "show") == 0  # no config.json yet: the defaults
@@ -584,17 +607,16 @@ def test_config_show_masks_the_secret(
     assert "embed_cover = true" in out
     assert "js_runtimes = deno, node" in out
     assert "spotify_client_id = (not set)" in out
-    assert "spotify_client_secret = (not set)" in out
 
-    tmp_settings.spotify_client_id = "abc123"
-    tmp_settings.spotify_client_secret = "hunter2"
-    tmp_settings.save()
+    # a config.json from 0.2 still holds a client secret: it is neither used nor shown
+    old = {**tmp_settings.to_dict(), "spotify_client_id": "abc123"}
+    old["spotify_client_secret"] = "hunter2-value"
+    Settings.default_path().write_text(json.dumps(old), encoding="utf-8")
     assert run("config", "show") == 0
     out = capsys.readouterr().out
     assert f"library_dir = {tmp_settings.library_dir}" in out
     assert "spotify_client_id = abc123" in out
-    assert "spotify_client_secret = ********" in out
-    assert "hunter2" not in out
+    assert "secret" not in out and "hunter2-value" not in out
     for key in cli.CONFIG_KEYS:  # every setting is listed
         assert f"{key} = " in out
 
@@ -614,15 +636,13 @@ def test_config_set_saves_the_value(
     assert new_dir.is_dir()  # created
     assert Settings.load().library_dir == new_dir
 
-    assert run("config", "set", "spotify_client_secret", "  hunter2 ") == 0
-    out = capsys.readouterr().out
-    assert "spotify_client_secret = ********" in out and "hunter2" not in out
-    assert Settings.load().spotify_client_secret == "hunter2"  # stripped, stored as-is
+    capsys.readouterr()
     assert run("config", "set", "spotify-client-id", " abc123 ") == 0  # dashes are fine too
-    assert Settings.load().spotify_client_id == "abc123"
-    assert run("config", "set", "spotify_client_secret", "") == 0  # an empty value clears
-    assert Settings.load().spotify_client_secret == ""
-    assert "spotify_client_secret = (not set)" in capsys.readouterr().out
+    assert Settings.load().spotify_client_id == "abc123"  # stripped
+    assert "spotify_client_id = abc123" in capsys.readouterr().out
+    assert run("config", "set", "spotify_client_id", "") == 0  # an empty value clears
+    assert Settings.load().spotify_client_id == ""
+    assert "spotify_client_id = (not set)" in capsys.readouterr().out
 
     assert run("config", "set", "embed_cover", "no") == 0
     assert Settings.load().embed_cover is False
@@ -645,7 +665,9 @@ def test_config_set_rejects_bad_values(
         (("concurrency", "lots"), "whole number"),
         (("colour", "purple"), "Unknown setting 'colour'"),
         (("spotify_client_id", "ünïcode"), "plain ASCII"),
-        (("spotify_client_secret", "x" * 201), "too long"),
+        (("spotify_client_id", "x" * 101), "too long"),
+        (("spotify_client_secret", "hunter2"), "no longer needs a client secret"),
+        (("spotify-client-secret", ""), "only spotify_client_id is used"),
         (("embed_cover", "maybe"), "true or false"),
         (("js_runtimes", "foo"), "'foo'"),
         (("audio_format", "wma"), "mp3, m4a, opus, flac"),
@@ -700,6 +722,292 @@ def test_config_requires_an_action(capsys: pytest.CaptureFixture[str]) -> None:
     assert cli.main(["config", "set", "concurrency"]) == 2  # VALUE is required
     assert cli.main(["config", "--help"]) == 0
     assert "show" in capsys.readouterr().out
+
+
+# -- config set while the app is running -------------------------------------------------------
+
+
+def test_config_set_goes_through_the_running_app(
+    tmp_settings: Settings, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The running app writes config.json from memory: a file written behind its back would
+    be lost at its next save, so the change is handed to the app instead."""
+    tmp_settings.save()
+    before = Settings.default_path().read_text(encoding="utf-8")
+    calls: list[tuple[str, str, str, Any]] = []
+
+    def call_running_app(base_url: str, method: str, path: str, body: Any = None) -> Any:
+        calls.append((base_url, method, path, body))
+        return {**tmp_settings.to_dict(), "concurrency": 3}
+
+    pretend_running(monkeypatch, "http://127.0.0.1:8766/")
+    monkeypatch.setattr(cli, "call_running_app", call_running_app)
+    assert run("config", "set", "concurrency", "3") == 0
+    out = capsys.readouterr().out
+    assert "concurrency = 3" in out and "running app at http://127.0.0.1:8766/" in out
+    assert calls == [("http://127.0.0.1:8766/", "PUT", "api/settings", {"concurrency": 3})]
+    assert Settings.default_path().read_text(encoding="utf-8") == before  # the app saves it
+
+    # values travel as the API expects them
+    calls.clear()
+    assert run("config", "set", "ffmpeg_path", "") == 0
+    assert run("config", "set", "js_runtimes", "node") == 0
+    assert [c[3] for c in calls] == [{"ffmpeg_path": ""}, {"js_runtimes": ["node"]}]
+
+
+def test_config_set_reports_what_the_running_app_answered(
+    tmp_settings: Settings, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    tmp_settings.save()
+    before = Settings.default_path().read_text(encoding="utf-8")
+    pretend_running(monkeypatch, "http://127.0.0.1:8765/")
+    answers: list[BaseException] = [
+        cli.RunningAppError("Wait for the current downloads to finish.", 409),
+        cli.RunningAppError("Cannot create the library folder X: denied", 400),
+        TimeoutError("timed out"),
+    ]
+
+    def call_running_app(base_url: str, method: str, path: str, body: Any = None) -> Any:
+        raise answers.pop(0)
+
+    monkeypatch.setattr(cli, "call_running_app", call_running_app)
+    assert run("config", "set", "concurrency", "4") == 1
+    assert "Wait for the current downloads to finish." in capsys.readouterr().err
+    assert run("config", "set", "concurrency", "4") == 2  # a value the app refused
+    assert "Cannot create the library folder" in capsys.readouterr().err
+    assert run("config", "set", "concurrency", "4") == 1
+    assert "Nothing was changed" in capsys.readouterr().err
+    assert Settings.default_path().read_text(encoding="utf-8") == before
+
+
+def test_config_set_checks_the_value_before_asking_the_app(
+    tmp_settings: Settings, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    pretend_running(monkeypatch, "http://127.0.0.1:8765/")
+
+    def never(*args: object, **kwargs: object) -> None:
+        raise AssertionError("an invalid value must not reach the running app")
+
+    monkeypatch.setattr(cli, "call_running_app", never)
+    assert run("config", "set", "concurrency", "9") == 2
+    assert run("config", "set", "spotify_client_secret", "x") == 2
+    assert "between 1 and 6" in capsys.readouterr().err
+
+
+def test_call_running_app(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, Any] = {}
+
+    class Response(io.BytesIO):
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            self.close()
+
+    def answer(request: Any, timeout: float = 0) -> Response:
+        seen.update(
+            url=request.full_url,
+            method=request.get_method(),
+            body=request.data,
+            content_type=request.get_header("Content-type"),
+            timeout=timeout,
+        )
+        return Response(b'{"concurrency": 3}')
+
+    monkeypatch.setattr(cli._opener, "open", answer)
+    reply = cli.call_running_app(
+        "http://127.0.0.1:8765/", "PUT", "api/settings", {"concurrency": 3}
+    )
+    assert reply == {"concurrency": 3}
+    assert cli.RUNNING_APP_TIMEOUT == 5.0  # the documented limit
+    assert seen == {
+        "url": "http://127.0.0.1:8765/api/settings",
+        "method": "PUT",
+        "body": b'{"concurrency": 3}',
+        "content_type": "application/json",
+        "timeout": 5.0,
+    }
+
+    def refuse(request: Any, timeout: float = 0) -> Response:
+        body = io.BytesIO(b'{"detail": "Concurrency must be between 1 and 6."}')
+        raise urllib.error.HTTPError(request.full_url, 400, "Bad Request", {}, body)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(cli._opener, "open", refuse)
+    with pytest.raises(cli.RunningAppError, match="between 1 and 6") as info:
+        cli.call_running_app("http://127.0.0.1:8765/", "PUT", "api/settings", {"concurrency": 9})
+    assert info.value.status == 400
+
+
+def test_api_value() -> None:
+    assert cli.api_value("library_dir", Path("lib")) == str(Path("lib"))
+    assert cli.api_value("ffmpeg_path", None) == ""  # "" = look on PATH again; null = unchanged
+    assert cli.api_value("js_runtimes", ["node"]) == ["node"]
+    assert cli.api_value("embed_cover", False) is False
+
+
+# -- spotify -----------------------------------------------------------------------------------
+
+ACCESS_TOKEN = "ACCESS-token-0123456789"
+REFRESH_TOKEN = "REFRESH-token-9876543210"
+
+
+def write_spotify_sign_in(client_id: str = "abc123") -> Path:
+    """A token file exactly as spotify_auth writes it (its format is part of that contract)."""
+    path = app_data_dir() / "spotify_auth.json"
+    record = {
+        "refresh_token": REFRESH_TOKEN,
+        "access_token": ACCESS_TOKEN,
+        "expires_at": time.time() + 3600,
+        "scope": "playlist-read-private playlist-read-collaborative user-library-read",
+        "user_id": "listener1",
+        "display_name": "Some Listener",
+        "client_id": client_id,
+    }
+    path.write_text(json.dumps(record), encoding="utf-8")
+    return path
+
+
+def test_spotify_status(
+    tmp_settings: Settings, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    tmp_settings.save()
+    assert run("spotify", "status") == 0
+    out = capsys.readouterr().out
+    assert "Client ID:    (not set)" in out and "not connected" in out
+    assert "Redirect URI: http://127.0.0.1:8765/api/spotify/callback" in out
+
+    write_spotify_sign_in(client_id="abc123")
+    tmp_settings.spotify_client_id = "abc123"
+    tmp_settings.save()
+    assert run("spotify", "status") == 0
+    out = capsys.readouterr().out
+    assert "connected as Some Listener (Spotify user listener1)" in out
+    assert "user-library-read" in out
+    assert ACCESS_TOKEN not in out and REFRESH_TOKEN not in out
+
+    tmp_settings.spotify_client_id = "another-app"  # the sign-in belongs to a different app
+    tmp_settings.save()
+    assert run("spotify", "status") == 0
+    assert "not connected (open Settings" in capsys.readouterr().out
+
+    pretend_running(monkeypatch, "http://127.0.0.1:8767/")  # the app landed on a fallback port
+    assert run("spotify", "status") == 0
+    out = capsys.readouterr().out
+    assert "Redirect URI: http://127.0.0.1:8767/api/spotify/callback" in out
+
+
+def test_spotify_login_prints_the_steps_and_opens_the_running_app(
+    tmp_settings: Settings, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    opened: list[str] = []
+    monkeypatch.setattr(cli.webbrowser, "open", lambda url: opened.append(url))
+    tmp_settings.save()  # no Client ID yet: the developer-app steps come first
+    assert run("spotify", "login") == 0
+    out = capsys.readouterr().out
+    assert "https://developer.spotify.com/dashboard" in out
+    assert "http://127.0.0.1:8765/api/spotify/callback" in out
+    assert "config set spotify_client_id" in out and "Connect Spotify" in out
+    # from source the command is `uv run up` (a bare `up` is only on PATH in an active venv)
+    assert "Run `uv run up config set spotify_client_id <its Client ID>`" in out
+    assert "(run `uv run up`)" in out
+    assert "the app's owner needs Spotify Premium" in out  # not every account that connects
+    assert opened == []
+
+    tmp_settings.spotify_client_id = "abc123"
+    tmp_settings.save()
+    assert run("spotify", "login") == 0  # no running app: the steps only
+    out = capsys.readouterr().out
+    assert "Connect Spotify" in out and "dashboard" not in out
+    assert opened == []
+
+    pretend_running(monkeypatch, "http://127.0.0.1:8766/")
+    assert run("spotify", "login") == 0
+    assert "opening http://127.0.0.1:8766/api/spotify/login" in capsys.readouterr().out
+    assert opened == ["http://127.0.0.1:8766/api/spotify/login"]
+
+
+def test_spotify_logout_without_a_running_app(
+    tmp_settings: Settings, capsys: pytest.CaptureFixture[str]
+) -> None:
+    token_file = write_spotify_sign_in()
+    assert run("spotify", "logout") == 0
+    assert "Disconnected from Spotify" in capsys.readouterr().out
+    assert not token_file.exists()
+    assert run("spotify", "logout") == 0
+    assert "was not connected" in capsys.readouterr().out
+
+
+def test_spotify_logout_goes_through_the_running_app(
+    tmp_settings: Settings, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls: list[tuple[str, str, str]] = []
+
+    def call_running_app(base_url: str, method: str, path: str, body: Any = None) -> Any:
+        calls.append((base_url, method, path))
+        return {"ok": True}
+
+    pretend_running(monkeypatch, "http://127.0.0.1:8765/")
+    monkeypatch.setattr(cli, "call_running_app", call_running_app)
+    assert run("spotify", "logout") == 0
+    assert "Disconnected from Spotify" in capsys.readouterr().out
+    assert calls == [("http://127.0.0.1:8765/", "POST", "api/spotify/logout")]
+
+    def unreachable(*args: object, **kwargs: object) -> None:
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(cli, "call_running_app", unreachable)
+    assert run("spotify", "logout") == 1
+    assert "could not disconnect" in capsys.readouterr().err
+
+
+def test_spotify_requires_an_action(capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(["spotify"]) == 2
+    assert "ACTION" in capsys.readouterr().err
+    assert cli.main(["spotify", "--help"]) == 0
+    out = capsys.readouterr().out
+    assert "status" in out and "login" in out and "logout" in out
+
+
+def test_port_option_names_the_running_app(
+    tmp_settings: Settings, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An app started with `serve --port N` is not on the ports the scan tries: `--port N`
+    points `config set` and `spotify` at it, and only that port is asked."""
+    tmp_settings.save()
+    probed: list[int] = []
+
+    def running(host: str, port: int, timeout: float = cli.JOIN_TIMEOUT) -> str | None:
+        probed.append(port)
+        return f"http://{host}:{port}/" if port == 9000 else None
+
+    def scan(*args: object, **kwargs: object) -> None:
+        raise AssertionError("--port must not scan the default ports")
+
+    calls: list[tuple[str, str, str, Any]] = []
+
+    def call_running_app(base_url: str, method: str, path: str, body: Any = None) -> Any:
+        calls.append((base_url, method, path, body))
+        return {"concurrency": 3}
+
+    monkeypatch.setattr(cli, "running_instance", running)
+    monkeypatch.setattr(cli, "find_running_instance", scan)
+    monkeypatch.setattr(cli, "call_running_app", call_running_app)
+    assert run("config", "set", "concurrency", "3", "--port", "9000") == 0
+    assert calls == [("http://127.0.0.1:9000/", "PUT", "api/settings", {"concurrency": 3})]
+    assert "running app at http://127.0.0.1:9000/" in capsys.readouterr().out
+    assert run("spotify", "status", "--port", "9000") == 0
+    assert "Redirect URI: http://127.0.0.1:9000/api/spotify/callback" in capsys.readouterr().out
+
+    # nothing on that port: the file is written, and the Redirect URI still names the port
+    assert run("spotify", "status", "--port", "9001") == 0
+    assert "Redirect URI: http://127.0.0.1:9001/api/spotify/callback" in capsys.readouterr().out
+    assert run("config", "set", "concurrency", "4", "--port", "9001") == 0
+    assert Settings.load().concurrency == 4
+    assert probed == [9000, 9000, 9001, 9001]
+    assert len(calls) == 1
+
+    assert cli.main(["config", "set", "concurrency", "3", "--port", "70000"]) == 2
+    assert "1 to 65535" in capsys.readouterr().err
 
 
 # -- export ------------------------------------------------------------------------------------

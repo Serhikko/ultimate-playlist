@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 (2026-09-13)
+## 0.2.0 (2026-09-15)
 
 Spotify links.
 
@@ -10,12 +10,39 @@ Spotify links.
   tagged with Spotify's data and Spotify's cover art. No Spotify audio is touched. Library id
   `spotify:<track id>`; the matched YouTube video is shown in the queue and kept in the tags
   (`TXXX YOUTUBE_ID`).
-- Works without an account (Spotify's public embed pages; a playlist is read up to 100 songs).
-  With your own Spotify developer app (`spotify_client_id` / `spotify_client_secret` in the
-  settings) playlists of any size are read through the Spotify Web API.
-- Settings dialog (gear icon) in the web UI, backed by `PUT /api/settings`. The Spotify secret
-  is masked wherever settings are shown (`GET /api/settings`, `up config show`).
-- `up config show` and `up config set <key> <value>` edit `config.json` from the command line.
+- Works without an account: Spotify's public pages give tracks, complete albums and the first
+  100 songs of a playlist.
+- **Connect Spotify** (Settings): with a free Spotify developer app of your own (only its Client
+  ID; no client secret is needed or stored; the account that creates the developer app needs
+  Spotify Premium, which is Spotify's rule for developer apps, while accounts added to it under
+  User Management do not) and a
+  one-time approval in the browser (Authorization Code with PKCE), your own and collaborative
+  playlists of any size and your **Liked Songs** (a button in Settings, or paste
+  `https://open.spotify.com/collection/tracks`) are read through the Spotify Web API. Other
+  people's playlists stay at their first 100 songs: since March 2026 Spotify only shares the
+  contents of playlists you own or collaborate on. The sign-in is kept in `spotify_auth.json`
+  and is never shown or logged. New routes `GET /api/spotify`, `GET /api/spotify/login`,
+  `GET /api/spotify/callback` and `POST /api/spotify/logout`; new commands
+  `up spotify status|login|logout`. Whenever a Web API request fails (for example once the
+  developer app's owner has no Premium any more), tracks, albums and playlists are read from the
+  public pages instead.
+- Settings dialog (gear icon) in the web UI, backed by `PUT /api/settings`: library folder,
+  parallel downloads, and the Spotify section (Client ID, the Redirect URI with a Copy button,
+  Connect / Disconnect).
+- `up config show` and `up config set <key> <value>` from the command line. `config set` hands
+  the change to the running app when there is one (`--port` for an app on a port of your
+  choice), so it takes effect at once.
+- The queue names what a link expanded into: "Album: Random Access Memories (13 tracks)" or
+  "Playlist: <name> (N tracks)" instead of "Playlist: N tracks".
+- Matching safeguards: a live, acoustic, unplugged, remix, demo or piano track is no longer
+  matched to the studio recording, nor the other way round, while edition labels ("Remastered 2011",
+  "Radio Edit", "Album Version") still match; an artist whose name is only part of another
+  ("Nas" / "Lil Nas X") is refused; titles with extra words ("Stay" / "Stay With Me") need a
+  near-identical spelling and "Pt. 2" / "Song 2" never pass for the plain title; with no
+  Spotify duration, uploads longer than 15 minutes are refused. A variant word that is part of
+  the song name ("Live Forever") does not let a live recording through; language, alternate
+  and re-recorded versions ("Spanish Version", "Taylor's Version") are not taken for the
+  original; a "(Clean)" catalogue entry counts as the same song.
 - `requests` is a new runtime dependency (Spotify metadata).
 - Docs: README rewritten for the public repository (quick start, Spotify section);
   `docs/ARCHITECTURE.md` describes the implemented Spotify design and the generic "add a

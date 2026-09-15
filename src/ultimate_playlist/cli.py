@@ -17,19 +17,19 @@ from collections.abc import Sequence
 from dataclasses import fields, replace
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from . import __version__
 from .bundled import is_frozen
 from .config import (
     MAX_CONCURRENCY,
     MIN_CONCURRENCY,
-    SECRET_MASK,
     Settings,
     app_data_dir,
     clean_audio_format,
     clean_audio_quality,
+    clean_client_id,
     clean_concurrency,
-    clean_credential,
     clean_js_runtimes,
 )
 from .ffmpeg import find_ffmpeg, install_hint
@@ -60,8 +60,11 @@ PORT_ATTEMPTS = 11
 JOIN_TIMEOUT = 3.0  # seconds to wait for /api/version; a closed port refuses at once
 JOIN_PAUSE = 1.5  # seconds the "already running" line stays readable before the window closes
 POLL_INTERVAL = 0.2  # seconds between progress checks in `add`
+RUNNING_APP_TIMEOUT = 5.0  # seconds a running app gets to answer `config set` / `spotify logout`
 EXIT_OK, EXIT_FAILURE, EXIT_INTERRUPTED = 0, 1, 130
 EXIT_USAGE = 2  # what argparse uses for a bad command line; `config set` errors are the same kind
+NO_SECRET_MESSAGE = "Spotify no longer needs a client secret; only spotify_client_id is used."
+SPOTIFY_DASHBOARD_URL = "https://developer.spotify.com/dashboard"
 
 # A loopback probe must never go through HTTP_PROXY (set on corporate machines, usually without
 # NO_PROXY=127.0.0.1): the default opener would send it to the proxy, which cannot answer.
@@ -190,6 +193,45 @@ def find_running_instance(host: str, port: int, attempts: int = PORT_ATTEMPTS) -
         if url:
             return url
     return None
+
+
+class RunningAppError(Exception):
+    """The running app answered with an error; the message is its own `detail` text."""
+
+    def __init__(self, message: str, status: int) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def call_running_app(
+    base_url: str,
+    method: str,
+    path: str,
+    body: dict[str, Any] | None = None,
+    timeout: float = RUNNING_APP_TIMEOUT,
+) -> Any:
+    """One JSON request to a running copy of the app (loopback, never through a proxy).
+
+    Returns the decoded answer. Raises RunningAppError for an error answer and OSError when
+    the app cannot be reached or does not answer in time.
+    """
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    request = urllib.request.Request(
+        base_url + path,
+        data=data,
+        method=method,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+    )
+    try:
+        with _opener.open(request, timeout=timeout) as response:
+            text = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = json.loads(exc.read().decode("utf-8")).get("detail")
+        except (OSError, ValueError, AttributeError):
+            detail = None
+        raise RunningAppError(str(detail or f"HTTP {exc.code}"), exc.code) from None
+    return json.loads(text) if text else None
 
 
 def _set_console_title(title: str) -> None:
@@ -416,21 +458,31 @@ def parse_setting(key: str, raw: str) -> Any:
     if key == "js_runtimes":
         return clean_js_runtimes(re.split(r"[,\s]+", text))
     if key == "spotify_client_id":
-        return clean_credential(text, "Spotify client ID")
-    if key == "spotify_client_secret":
-        return clean_credential(text, "Spotify client secret")
+        return clean_client_id(text)
     raise ValueError(f"Unknown setting '{key}'. Settings you can change: {', '.join(CONFIG_KEYS)}")
+
+
+def api_value(key: str, value: Any) -> Any:
+    """A parsed setting as `PUT /api/settings` expects it in its JSON body."""
+    if isinstance(value, Path):
+        return str(value)
+    if key == "ffmpeg_path" and value is None:
+        return ""  # the API reads "" as "look on PATH again"; null means "not in this update"
+    return value
 
 
 def cmd_config(args: argparse.Namespace) -> int:
     if args.config_command == "show":
         settings = load_settings(args.library)
         say(f"Config file: {Settings.default_path()}")
-        for key, value in settings.public_dict().items():  # the Spotify secret is masked
+        for key, value in settings.to_dict().items():
             say(f"{key} = {format_setting(value)}")
         return EXIT_OK
 
     key = args.key.strip().lower().replace("-", "_")
+    if key == "spotify_client_secret":  # pre-release 0.2 builds had it; connecting needs none
+        complain(NO_SECRET_MESSAGE)
+        return EXIT_USAGE
     if key not in CONFIG_KEYS:
         complain(f"Unknown setting '{args.key}'. Settings you can change: {', '.join(CONFIG_KEYS)}")
         return EXIT_USAGE
@@ -441,6 +493,35 @@ def cmd_config(args: argparse.Namespace) -> int:
         return EXIT_USAGE
     if args.library:
         complain("Note: --library is ignored by `config set`; it changes the saved config.json.")
+    # A running app keeps its settings in memory and writes config.json from there: a file
+    # written behind its back would be overwritten by its next save. So it gets the change
+    # instead (it validates, saves and applies it at once) and only without one is the file
+    # written here.
+    url = _running_app(args)
+    if url:
+        return _config_set_on_running_app(url, key, value)
+    return _config_set_in_file(key, value)
+
+
+def _config_set_on_running_app(url: str, key: str, value: Any) -> int:
+    try:
+        answer = call_running_app(url, "PUT", "api/settings", {key: api_value(key, value)})
+    except RunningAppError as exc:
+        complain(f"The running app at {url} did not accept the change: {exc}")
+        return EXIT_USAGE if exc.status in (400, 422) else EXIT_FAILURE
+    except OSError as exc:
+        complain(
+            f"Ultimate Playlist is running at {url} but did not answer ({exc}). Nothing was "
+            "changed; try again, or use the Settings dialog."
+        )
+        return EXIT_FAILURE
+    shown = answer.get(key, value) if isinstance(answer, dict) else value
+    say(f"{key} = {format_setting(shown)}")
+    say(f"Saved and applied by the running app at {url}.")
+    return EXIT_OK
+
+
+def _config_set_in_file(key: str, value: Any) -> int:
     settings = Settings.load()  # the file, not a --library override that must not be persisted
     setattr(settings, key, value)
     try:
@@ -451,8 +532,97 @@ def cmd_config(args: argparse.Namespace) -> int:
     from . import providers
 
     providers.configure(settings)
-    shown = SECRET_MASK if key == "spotify_client_secret" and value else format_setting(value)
-    say(f"{key} = {shown}")
+    say(f"{key} = {format_setting(value)}")
+    return EXIT_OK
+
+
+def _running_app(args: argparse.Namespace) -> str | None:
+    """The running copy `config set` / `spotify` talk to: the one on `--port` when given (an
+    app started with `serve --port N`), else one on 8765 or a port serve() falls back to."""
+    port = getattr(args, "port", None)
+    if port:
+        return running_instance(DEFAULT_HOST, port)
+    return find_running_instance(DEFAULT_HOST, DEFAULT_PORT)
+
+
+def _redirect_uri(spotify_auth: Any, running_url: str | None, port: int | None = None) -> str:
+    """The Redirect URI for the running app's port, else for `port` (--port), else 8765."""
+    running_port = urlsplit(running_url).port if running_url else None
+    return str(spotify_auth.redirect_uri(running_port or port or DEFAULT_PORT))
+
+
+def cmd_spotify(args: argparse.Namespace) -> int:
+    from .providers import spotify_auth
+
+    settings = Settings.load()
+    url = _running_app(args)
+    port = getattr(args, "port", None)
+    if args.spotify_command == "status":
+        return _spotify_status(spotify_auth, settings, url, port)
+    if args.spotify_command == "login":
+        return _spotify_login(spotify_auth, settings, url, port)
+    return _spotify_logout(spotify_auth, url)
+
+
+def _spotify_status(
+    spotify_auth: Any, settings: Settings, url: str | None, port: int | None = None
+) -> int:
+    """The connection state, from config.json and the saved sign-in. Never a token."""
+    client_id = settings.spotify_client_id
+    say(f"Client ID:    {client_id or '(not set)'}")
+    # A sign-in made through another Client ID does not count (spotify_auth binds them).
+    account = spotify_auth.current_account(client_id) if client_id else None
+    if account is not None:
+        name = account.display_name or account.user_id
+        say(f"Connection:   connected as {name} (Spotify user {account.user_id})")
+        say(f"Access:       {account.scope or '(none)'}")
+    elif client_id:
+        say("Connection:   not connected (open Settings in the app and click Connect Spotify)")
+    else:
+        say("Connection:   not connected (Spotify links use Spotify's public pages)")
+    note = f" (the app is running at {url})" if url else ""
+    say(f"Redirect URI: {_redirect_uri(spotify_auth, url, port)}{note}")
+    return EXIT_OK
+
+
+def _spotify_login(
+    spotify_auth: Any, settings: Settings, url: str | None, port: int | None = None
+) -> int:
+    start = "double-click UltimatePlaylist.exe" if is_frozen() else f"run `{run_hint()}`"
+    steps: list[str] = []
+    if not settings.spotify_client_id:
+        steps.append(
+            f"Create a free app at {SPOTIFY_DASHBOARD_URL} (the app's owner needs Spotify "
+            f"Premium): add the Redirect URI {_redirect_uri(spotify_auth, url, port)}, tick "
+            "Web API, save."
+        )
+        steps.append(f"Run `{run_hint()} config set spotify_client_id <its Client ID>`.")
+    steps.append(f"Start the app ({start}) if it is not running yet.")
+    steps.append("Open Settings (the gear icon at the top right) and click Connect Spotify.")
+    steps.append("Allow access on Spotify's page; you land back in the app, connected.")
+    say("Connecting Spotify happens in your browser:")
+    for number, step in enumerate(steps, 1):
+        say(f"  {number}. {step}")
+    if url and settings.spotify_client_id:
+        login = url + "api/spotify/login"
+        say(f"The app is running: opening {login} in your browser.")
+        webbrowser.open(login)
+    return EXIT_OK
+
+
+def _spotify_logout(spotify_auth: Any, url: str | None) -> int:
+    if url:  # let the running app do it, so nothing it holds in memory outlives the sign-in
+        try:
+            call_running_app(url, "POST", "api/spotify/logout")
+        except (RunningAppError, OSError) as exc:
+            complain(f"The running app at {url} could not disconnect Spotify: {exc}")
+            return EXIT_FAILURE
+        say("Disconnected from Spotify: the saved sign-in was deleted.")
+        return EXIT_OK
+    if spotify_auth.logout():
+        say("Disconnected from Spotify: the saved sign-in was deleted.")
+    else:
+        say("Spotify was not connected; nothing to do.")
     return EXIT_OK
 
 
@@ -533,6 +703,34 @@ def prog_name() -> str:
     return Path(sys.executable).name if is_frozen() else "up"
 
 
+def run_hint() -> str:
+    """The command as a user types it: `uv run up` in a source checkout (the README's
+    spelling; a bare `up` is only on PATH inside an activated venv), the exe's name otherwise."""
+    return prog_name() if is_frozen() else "uv run up"
+
+
+def _port_number(text: str) -> int:
+    try:
+        port = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a port number: {text!r}") from None
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("a port is a number from 1 to 65535")
+    return port
+
+
+def _add_app_port(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """`--port` for the commands that talk to a running app (`config set`, `spotify ...`)."""
+    parser.add_argument(
+        "--port",
+        type=_port_number,
+        default=None,
+        help="the port of the running app, if you started it with `serve --port` "
+        f"(default: look on {DEFAULT_PORT} and the next {PORT_ATTEMPTS - 1})",
+    )
+    return parser
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=prog_name(),
@@ -579,14 +777,13 @@ def build_parser() -> argparse.ArgumentParser:
     config = sub.add_parser("config", help="show or change the saved settings (config.json)")
     config_sub = config.add_subparsers(dest="config_command", metavar="ACTION")
     config_sub.required = True
-    config_sub.add_parser(
-        "show", help="print every setting (the Spotify client secret is masked)"
-    ).set_defaults(func=cmd_config)
+    config_sub.add_parser("show", help="print every setting").set_defaults(func=cmd_config)
     config_set = config_sub.add_parser(
         "set",
         help="change one setting, e.g. `config set concurrency 3`",
-        description="Change one setting in config.json. Text settings are cleared with an "
-        'empty value (""). The library folder is created if it does not exist.',
+        description="Change one setting in config.json (through the app when it is running, "
+        'so it takes effect at once). Text settings are cleared with an empty value (""). '
+        "The library folder is created if it does not exist.",
     )
     config_set.add_argument("key", metavar="KEY", help=f"one of: {', '.join(CONFIG_KEYS)}")
     config_set.add_argument(
@@ -594,7 +791,25 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="VALUE",
         help="the new value (true/false for embed_cover, a comma-separated list for js_runtimes)",
     )
+    _add_app_port(config_set)
     config_set.set_defaults(func=cmd_config)
+
+    spotify = sub.add_parser(
+        "spotify",
+        help="connect your Spotify account (status, login, logout)",
+        description="Connecting a Spotify account lets the app read your own playlists of any "
+        "size and your Liked Songs. It needs your own free Spotify developer app "
+        "(`config set spotify_client_id`) and happens in the browser.",
+    )
+    spotify_sub = spotify.add_subparsers(dest="spotify_command", metavar="ACTION")
+    spotify_sub.required = True
+    for action, text in (
+        ("status", "show whether a Spotify account is connected"),
+        ("login", "how to connect (opens the running app's Spotify sign-in)"),
+        ("logout", "disconnect and delete the saved Spotify sign-in"),
+    ):
+        _add_app_port(spotify_sub.add_parser(action, help=text)).set_defaults(func=cmd_spotify)
+
     sub.add_parser("rescan", help="sync the index with the library folder").set_defaults(
         func=cmd_rescan
     )

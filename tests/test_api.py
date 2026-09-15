@@ -12,7 +12,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import pytest
 from fake_provider import FakeProvider, FakeRegistry, playlist_url, track_url, write_tiny_mp3
@@ -25,6 +25,7 @@ from ultimate_playlist.downloader import JobManager
 from ultimate_playlist.library import Library
 from ultimate_playlist.models import JobStatus, Track
 from ultimate_playlist.playlists import PlaylistStore
+from ultimate_playlist.providers import spotify_auth
 from ultimate_playlist.server import app as server_app
 
 WAIT = 15.0
@@ -302,7 +303,7 @@ def test_put_settings_ignores_unknown_keys(client: TestClient) -> None:
     assert "colour" not in response.json()
 
 
-# -- Spotify credentials -----------------------------------------------------------------------
+# -- Spotify client ID -------------------------------------------------------------------------
 
 MASK = "********"
 
@@ -311,109 +312,434 @@ def saved_config() -> dict[str, Any]:
     return json.loads(Settings.default_path().read_text(encoding="utf-8"))
 
 
-def test_get_settings_masks_the_spotify_secret(client: TestClient, tmp_settings: Settings) -> None:
-    data = client.get("/api/settings").json()
-    assert data["spotify_client_id"] == "" and data["spotify_client_secret"] == ""
-    tmp_settings.spotify_client_id = "abc123"
-    tmp_settings.spotify_client_secret = "hunter2"
-    response = client.get("/api/settings")
-    data = response.json()
-    assert data["spotify_client_id"] == "abc123"  # the id is not sensitive
-    assert data["spotify_client_secret"] == MASK
-    assert "hunter2" not in response.text
-
-
-def test_put_settings_sets_and_keeps_the_spotify_secret(
+def test_put_settings_sets_and_clears_the_spotify_client_id(
     client: TestClient, tmp_settings: Settings
 ) -> None:
-    response = client.put(
-        "/api/settings",
-        json={"spotify_client_id": "  abc123 ", "spotify_client_secret": " hunter2\n"},
-    )
+    response = client.put("/api/settings", json={"spotify_client_id": "  abc123 "})
     assert response.status_code == 200, response.text
     assert response.json()["spotify_client_id"] == "abc123"  # stripped
-    assert response.json()["spotify_client_secret"] == MASK  # never echoed back
-    assert "hunter2" not in response.text
     assert tmp_settings.spotify_client_id == "abc123"
-    assert tmp_settings.spotify_client_secret == "hunter2"
-    assert saved_config()["spotify_client_secret"] == "hunter2"  # config.json holds it as-is
+    assert saved_config()["spotify_client_id"] == "abc123"
+    assert client.get("/api/settings").json()["spotify_client_id"] == "abc123"
+    response = client.put("/api/settings", json={"spotify_client_id": ""})  # "" clears it
+    assert response.status_code == 200, response.text
+    assert response.json()["spotify_client_id"] == "" and tmp_settings.spotify_client_id == ""
 
-    # the form sends the whole thing back, mask included: the secret stays what it was
+
+def test_settings_have_no_client_secret_any_more(
+    client: TestClient, tmp_settings: Settings
+) -> None:
+    """A page of the previous version may still send one: it is ignored, never stored."""
+    assert "spotify_client_secret" not in client.get("/api/settings").json()
     response = client.put(
-        "/api/settings",
-        json={"spotify_client_id": "abc123", "spotify_client_secret": MASK, "concurrency": 3},
+        "/api/settings", json={"spotify_client_secret": "hunter2-value", "concurrency": 3}
     )
     assert response.status_code == 200, response.text
-    assert tmp_settings.spotify_client_secret == "hunter2"
+    assert "hunter2-value" not in response.text
+    assert "spotify_client_secret" not in response.json()
+    assert "spotify_client_secret" not in saved_config()
     assert tmp_settings.concurrency == 3
-    assert saved_config()["spotify_client_secret"] == "hunter2"
-
-    # a new secret replaces the old one
-    response = client.put("/api/settings", json={"spotify_client_secret": "newer"})
-    assert response.status_code == 200, response.text
-    assert response.json()["spotify_client_secret"] == MASK
-    assert tmp_settings.spotify_client_secret == "newer"
-    assert saved_config()["spotify_client_secret"] == "newer"
-
-    # an empty string clears either field
-    response = client.put(
-        "/api/settings", json={"spotify_client_id": "", "spotify_client_secret": ""}
-    )
-    assert response.status_code == 200, response.text
-    assert response.json()["spotify_client_id"] == ""
-    assert response.json()["spotify_client_secret"] == ""
-    assert tmp_settings.spotify_client_id == "" and tmp_settings.spotify_client_secret == ""
-    assert client.get("/api/settings").json()["spotify_client_secret"] == ""
 
 
 @pytest.mark.parametrize(
-    ("field", "value", "fragment"),
+    ("value", "fragment"),
     [
-        ("spotify_client_id", "ünïcode", "plain ASCII"),
-        ("spotify_client_secret", "tab\there", "plain ASCII"),
-        ("spotify_client_secret", "line\nbreak", "plain ASCII"),
-        ("spotify_client_id", "x" * 201, "too long"),
-        ("spotify_client_secret", "y" * 201, "too long"),
+        ("ünïcode", "plain ASCII"),
+        ("tab\there", "plain ASCII"),
+        ("line\nbreak", "plain ASCII"),
+        ("x" * 101, "too long"),
     ],
 )
-def test_put_settings_rejects_bad_spotify_credentials(
-    client: TestClient, tmp_settings: Settings, field: str, value: str, fragment: str
+def test_put_settings_rejects_bad_spotify_client_ids(
+    client: TestClient, tmp_settings: Settings, value: str, fragment: str
 ) -> None:
     tmp_settings.spotify_client_id = "keep-id"
-    tmp_settings.spotify_client_secret = "keep-secret"
-    response = client.put("/api/settings", json={field: value})
+    response = client.put("/api/settings", json={"spotify_client_id": value})
     assert response.status_code == 400
     assert fragment in response.json()["detail"]
     assert tmp_settings.spotify_client_id == "keep-id"  # untouched
-    assert tmp_settings.spotify_client_secret == "keep-secret"
-    assert client.put("/api/settings", json={field: 123}).status_code == 422
-    assert client.put("/api/settings", json={field: ["a"]}).status_code == 422
+    assert client.put("/api/settings", json={"spotify_client_id": 123}).status_code == 422
+    assert client.put("/api/settings", json={"spotify_client_id": ["a"]}).status_code == 422
 
 
-def test_status_never_contains_the_spotify_secret(
-    client: TestClient, tmp_settings: Settings, monkeypatch: pytest.MonkeyPatch
+def test_put_settings_does_not_persist_a_one_off_library_override(
+    client: TestClient, tmp_path: Path, tmp_settings: Settings
+) -> None:
+    """`up --library X serve` is for this run only: saving another setting from the dialog
+    must not write X into config.json (while the running app keeps using X)."""
+    saved_dir = tmp_path / "saved-lib"
+    Settings(library_dir=saved_dir).save()  # config.json; tmp_settings plays the override
+    response = client.put("/api/settings", json={"concurrency": 4})
+    assert response.status_code == 200, response.text
+    assert response.json()["library_dir"] == str(tmp_path / "lib")  # the app keeps using X
+    assert tmp_settings.library_dir == tmp_path / "lib"
+    saved = saved_config()
+    assert saved["library_dir"] == str(saved_dir)  # ...but the file keeps its own folder
+    assert saved["concurrency"] == 4
+    # moving the library on purpose is persisted, of course
+    moved = tmp_path / "moved"
+    assert client.put("/api/settings", json={"library_dir": str(moved)}).status_code == 200
+    assert saved_config()["library_dir"] == str(moved)
+    assert client.put("/api/settings", json={"embed_cover": False}).status_code == 200
+    assert saved_config()["library_dir"] == str(moved)
+
+
+# -- Spotify account ---------------------------------------------------------------------------
+
+ACCESS_TOKEN = "ACCESS-token-0123456789"
+REFRESH_TOKEN = "REFRESH-token-9876543210"
+CALLBACK_8765 = "http://127.0.0.1:8765/api/spotify/callback"
+
+
+def an_account(name: str = "Some Listener") -> Any:
+    return spotify_auth.SpotifyAccount(
+        user_id="listener1", display_name=name, scope=spotify_auth.SCOPES, expires_at=0.0
+    )
+
+
+def write_spotify_sign_in(client_id: str = "abc123") -> Path:
+    """A token file exactly as spotify_auth writes it (its format is part of that contract)."""
+    path = app_data_dir() / "spotify_auth.json"
+    record = {
+        "refresh_token": REFRESH_TOKEN,
+        "access_token": ACCESS_TOKEN,
+        "expires_at": time.time() + 3600,
+        "scope": spotify_auth.SCOPES,
+        "user_id": "listener1",
+        "display_name": "Some Listener",
+        "client_id": client_id,
+    }
+    path.write_text(json.dumps(record), encoding="utf-8")
+    return path
+
+
+@pytest.fixture
+def fake_auth(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    """spotify_auth with login, account lookup and logout replaced by recording fakes."""
+    calls = SimpleNamespace(begin=[], current=[], logouts=0, account=None)
+
+    def begin_login(client_id: str, redirect: str) -> str:
+        calls.begin.append((client_id, redirect))
+        return f"https://accounts.spotify.com/authorize?client_id={client_id}&state=s1"
+
+    def current_account(client_id: str | None = None) -> Any:
+        calls.current.append(client_id)
+        return calls.account
+
+    def logout() -> bool:
+        calls.logouts += 1
+        removed, calls.account = calls.account is not None, None
+        return removed
+
+    monkeypatch.setattr(spotify_auth, "begin_login", begin_login)
+    monkeypatch.setattr(spotify_auth, "current_account", current_account)
+    monkeypatch.setattr(spotify_auth, "logout", logout)
+    return calls
+
+
+def app_messages(caplog: pytest.LogCaptureFixture) -> str:
+    """What the app itself logged (the test client logs request URLs on its own)."""
+    return "\n".join(r.getMessage() for r in caplog.records if r.name.startswith("ultimate_"))
+
+
+def test_spotify_constants_match_the_auth_module() -> None:
+    assert server_app.SPOTIFY_CALLBACK_PATH == spotify_auth.CALLBACK_PATH
+    assert server_app.SPOTIFY_TOKEN_FILE == spotify_auth.TOKEN_FILE_NAME
+    assert spotify_auth.redirect_uri(8765) == CALLBACK_8765
+
+
+def test_spotify_state(client: TestClient, tmp_settings: Settings, fake_auth) -> None:
+    assert client.get("/api/spotify").json() == {
+        "client_id_set": False,
+        "connected": False,
+        "display_name": None,
+        "redirect_uri": CALLBACK_8765,
+        "connect_ok": True,
+        "last_error": None,
+    }
+    fake_auth.account = an_account()
+    assert client.get("/api/spotify").json()["connected"] is False  # no Client ID: not connected
+    tmp_settings.spotify_client_id = "abc123"
+    data = client.get("/api/spotify").json()
+    assert data["client_id_set"] is True and data["connected"] is True
+    assert data["display_name"] == "Some Listener"
+    assert fake_auth.current[-1] == "abc123"  # the sign-in must belong to the configured app
+
+
+def test_spotify_state_reads_the_real_sign_in(client: TestClient, tmp_settings: Settings) -> None:
+    """Through the real spotify_auth: the account counts for the Client ID it came from."""
+    write_spotify_sign_in(client_id="abc123")
+    tmp_settings.spotify_client_id = "abc123"
+    response = client.get("/api/spotify")
+    assert response.json()["connected"] is True
+    assert response.json()["display_name"] == "Some Listener"
+    assert ACCESS_TOKEN not in response.text and REFRESH_TOKEN not in response.text
+    tmp_settings.spotify_client_id = "another-app"
+    assert client.get("/api/spotify").json()["connected"] is False
+
+
+def test_spotify_login_redirects_to_spotify(
+    client: TestClient, tmp_settings: Settings, fake_auth
 ) -> None:
     tmp_settings.spotify_client_id = "abc123"
-    tmp_settings.spotify_client_secret = "hunter2-secret"
+    response = client.get("/api/spotify/login", follow_redirects=False)
+    assert response.status_code == 302
+    assert response.headers["location"] == (
+        "https://accounts.spotify.com/authorize?client_id=abc123&state=s1"
+    )
+    assert response.headers["cache-control"] == "no-store"
+    assert fake_auth.begin == [("abc123", CALLBACK_8765)]
 
-    class Leaky:  # a provider that (wrongly) echoes what it was configured with
+
+def test_spotify_login_asks_for_pkce_and_the_three_scopes(
+    client: TestClient, tmp_settings: Settings
+) -> None:
+    """The real begin_login (no network involved): what the browser is sent to."""
+    tmp_settings.spotify_client_id = "abc123"
+    response = client.get("/api/spotify/login", follow_redirects=False)
+    assert response.status_code == 302
+    location = urlsplit(response.headers["location"])
+    assert (location.scheme, location.netloc, location.path) == (
+        "https",
+        "accounts.spotify.com",
+        "/authorize",
+    )
+    query = parse_qs(location.query)
+    assert query["client_id"] == ["abc123"]
+    assert query["redirect_uri"] == [CALLBACK_8765]
+    assert query["code_challenge_method"] == ["S256"]
+    assert query["code_challenge"][0] and query["state"][0]
+    assert set(query["scope"][0].split()) == {
+        "playlist-read-private",
+        "playlist-read-collaborative",
+        "user-library-read",
+    }
+    assert "client_secret" not in query
+
+
+def test_spotify_login_without_a_client_id_is_a_friendly_400(client: TestClient, fake_auth) -> None:
+    response = client.get("/api/spotify/login", follow_redirects=False)
+    assert response.status_code == 400
+    assert "Client ID" in response.json()["detail"]
+    page = client.get(
+        "/api/spotify/login",
+        headers={"Accept": "text/html,application/xhtml+xml"},
+        follow_redirects=False,
+    )
+    assert page.status_code == 400
+    assert page.headers["content-type"].startswith("text/html")
+    assert "Client ID" in page.text and 'href="/"' in page.text
+    assert fake_auth.begin == []
+
+
+def test_spotify_login_problem_goes_back_to_the_app(
+    client: TestClient, tmp_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(client_id: str, redirect: str) -> str:
+        raise spotify_auth.SpotifyAuthError("Nope, try later")
+
+    monkeypatch.setattr(spotify_auth, "begin_login", refuse)
+    tmp_settings.spotify_client_id = "abc123"
+    response = client.get("/api/spotify/login", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/?spotify=error"  # the message stays server-side
+    assert client.get("/api/spotify").json()["last_error"] == "Nope, try later"
+    assert client.get("/api/spotify").json()["last_error"] is None  # handed out once
+
+
+def test_a_message_in_the_address_is_never_shown(client: TestClient) -> None:
+    """Any web site can link to the app with ?spotify_error=<text>: nothing shows that text."""
+    page = client.get("/?spotify_error=Your%20library%20is%20corrupt%2C%20get%20the%20fix")
+    assert page.status_code == 200 and "corrupt" not in page.text
+    assert client.get("/api/spotify").json()["last_error"] is None
+    app_js = client.get("/static/app.js").text
+    assert "params.get('spotify_error')" not in app_js
+    assert "s.last_error" in app_js
+
+
+def test_connect_spotify_is_off_when_the_server_is_not_on_loopback(
+    tmp_settings: Settings, library: Library, playlists: PlaylistStore, fake_auth
+) -> None:
+    """`serve --host 192.168.1.5`: Spotify's redirect to 127.0.0.1 would find nothing there."""
+    for host in ("127.0.0.1", "localhost", "0.0.0.0", "::", "[::]"):
+        assert server_app.spotify_callback_reachable(host), host
+    for host in ("192.168.1.5", "::1", "my-pc.local"):
+        assert not server_app.spotify_callback_reachable(host), host
+    jobs = JobManager(tmp_settings, library, providers=FakeRegistry(FakeProvider()))
+    app = server_app.create_app(
+        settings=tmp_settings,
+        library=library,
+        playlists=playlists,
+        jobs=jobs,
+        spotify_connect_ok=False,
+    )
+    tmp_settings.spotify_client_id = "abc123"
+    try:
+        with TestClient(app, base_url=LOOPBACK) as test_client:
+            assert test_client.get("/api/spotify").json()["connect_ok"] is False
+            response = test_client.get("/api/spotify/login", follow_redirects=False)
+            assert response.status_code == 400
+            assert "127.0.0.1" in response.json()["detail"]
+    finally:
+        jobs.stop()
+    assert fake_auth.begin == []
+
+
+def test_redirect_uri_follows_the_port_the_server_listens_on(
+    tmp_settings: Settings, library: Library, playlists: PlaylistStore, fake_auth
+) -> None:
+    """On a fallback port the Redirect URI shown (and sent to Spotify) uses that port."""
+    jobs = JobManager(tmp_settings, library, providers=FakeRegistry(FakeProvider()))
+    app = server_app.create_app(
+        settings=tmp_settings, library=library, playlists=playlists, jobs=jobs, port=8781
+    )
+    expected = "http://127.0.0.1:8781/api/spotify/callback"
+    try:
+        with TestClient(app, base_url=LOOPBACK) as test_client:
+            assert test_client.get("/api/spotify").json()["redirect_uri"] == expected
+            tmp_settings.spotify_client_id = "abc123"
+            assert test_client.get("/api/spotify/login", follow_redirects=False).status_code == 302
+    finally:
+        jobs.stop()
+    assert fake_auth.begin == [("abc123", expected)]
+
+
+def test_spotify_callback_connects_and_goes_back_to_the_app(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[tuple[str, str | None, str | None]] = []
+
+    def finish_login(state: str, code: str | None, error: str | None) -> Any:
+        seen.append((state, code, error))
+        return an_account()
+
+    monkeypatch.setattr(spotify_auth, "finish_login", finish_login)
+    response = client.get(
+        "/api/spotify/callback", params={"code": "CODE-abc", "state": "st"}, follow_redirects=False
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/?spotify=connected"
+    assert response.headers["cache-control"] == "no-store"
+    assert seen == [("st", "CODE-abc", None)]
+    assert "CODE-abc" not in response.text
+
+
+def test_spotify_callback_failure_shows_the_message_without_the_code(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def finish_login(state: str, code: str | None, error: str | None) -> Any:
+        raise spotify_auth.SpotifyAuthError(f"Spotify refused the code {code}")  # (wrongly) echoed
+
+    monkeypatch.setattr(spotify_auth, "finish_login", finish_login)
+    with caplog.at_level(logging.INFO, logger="ultimate_playlist"):
+        response = client.get(
+            "/api/spotify/callback?code=CODE-xyz&state=st", follow_redirects=False
+        )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/?spotify=error"
+    assert client.get("/api/spotify").json()["last_error"] == f"Spotify refused the code {MASK}"
+    assert "CODE-xyz" not in app_messages(caplog)
+
+
+def test_spotify_callback_unexpected_error_is_generic(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def finish_login(state: str, code: str | None, error: str | None) -> Any:
+        raise RuntimeError(f"boom with {code}")
+
+    monkeypatch.setattr(spotify_auth, "finish_login", finish_login)
+    with caplog.at_level(logging.INFO, logger="ultimate_playlist"):
+        response = client.get("/api/spotify/callback?code=CODE-1&state=st", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/?spotify=error"
+    assert client.get("/api/spotify").json()["last_error"] == server_app.SPOTIFY_CONNECT_FAILED
+    assert "boom" in app_messages(caplog) and "CODE-1" not in app_messages(caplog)
+
+
+def test_spotify_callback_when_the_user_says_no(client: TestClient) -> None:
+    """Through the real finish_login: Spotify's error=access_denied becomes a friendly toast."""
+    response = client.get(
+        "/api/spotify/callback",
+        params={"error": "access_denied", "state": "x"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/?spotify=error"
+    message = client.get("/api/spotify").json()["last_error"]
+    assert "cancelled" in message.lower()
+
+
+def test_spotify_callback_passes_the_loopback_guard(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spotify's consent page sends the browser back with a cross-site, top-level GET: the
+    guard lets it through (GET is a safe method) as long as the Host is loopback."""
+    monkeypatch.setattr(spotify_auth, "finish_login", lambda state, code, error: an_account())
+    headers = {
+        "Host": "127.0.0.1:8765",
+        "Referer": "https://accounts.spotify.com/",
+        "Origin": "https://accounts.spotify.com",
+        "Sec-Fetch-Site": "cross-site",
+        "Sec-Fetch-Mode": "navigate",
+    }
+    response = client.get(
+        "/api/spotify/callback?code=c&state=s", headers=headers, follow_redirects=False
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/?spotify=connected"
+    # a DNS-rebinding host is still refused, and so is a cross-site logout
+    rebinding = client.get("/api/spotify/callback?code=c&state=s", headers={"Host": "evil.example"})
+    assert rebinding.status_code == 400
+    foreign = client.post("/api/spotify/logout", headers={"Origin": "https://evil.example"})
+    assert foreign.status_code == 403
+
+
+def test_spotify_logout(client: TestClient, tmp_settings: Settings, fake_auth) -> None:
+    tmp_settings.spotify_client_id = "abc123"
+    fake_auth.account = an_account()
+    assert client.get("/api/spotify").json()["connected"] is True
+    response = client.post("/api/spotify/logout")
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert fake_auth.logouts == 1
+    assert client.get("/api/spotify").json()["connected"] is False
+    assert client.post("/api/spotify/logout").json() == {"ok": True}  # nothing to do: still ok
+
+
+def test_no_spotify_token_ever_reaches_a_response(
+    client: TestClient, tmp_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tokens stay in spotify_auth's file; a provider that (wrongly) echoes one into its
+    doctor text has it scrubbed from /api/status."""
+    tmp_settings.spotify_client_id = "abc123"
+    write_spotify_sign_in(client_id="abc123")
+
+    class Leaky:
         name = "spotify"
         display_name = "Spotify"
 
         def matches(self, url: str) -> bool:
             return False
 
-        def doctor(self, settings: Settings) -> list[tuple[bool, str, str]]:
-            return [(True, f"Spotify ({settings.spotify_client_secret})", "ok, id abc123")]
+        def doctor(self, settings: Settings | None = None) -> list[tuple[bool, str, str]]:
+            return [(True, f"Spotify ({ACCESS_TOKEN})", f"connected, renews with {REFRESH_TOKEN}")]
 
-    monkeypatch.setattr(server_app, "providers", SimpleNamespace(PROVIDERS=[Leaky()]))
-    response = client.get("/api/status")
-    assert response.status_code == 200
-    assert "hunter2-secret" not in response.text
-    check = response.json()["providers"][0]["checks"][0]
+    monkeypatch.setattr(
+        server_app, "providers", SimpleNamespace(PROVIDERS=[Leaky()], configure=lambda s: None)
+    )
+    responses = [
+        client.get("/api/status"),
+        client.get("/api/settings"),
+        client.get("/api/spotify"),
+        client.get("/api/spotify/login", follow_redirects=False),
+    ]
+    for response in responses:
+        assert ACCESS_TOKEN not in response.text and REFRESH_TOKEN not in response.text
+        assert ACCESS_TOKEN not in response.headers.get("location", "")
+    check = responses[0].json()["providers"][0]["checks"][0]
     assert check["label"] == f"Spotify ({MASK})"
-    assert check["detail"] == "ok, id abc123"
-    assert "spotify_client_secret" not in response.json()  # settings are not part of status
+    assert check["detail"] == f"connected, renews with {MASK}"
+    assert "spotify_client_secret" not in responses[0].json()
 
 
 def test_put_settings_hands_the_live_settings_to_providers(
@@ -1040,6 +1366,7 @@ def test_create_app_builds_missing_objects(tmp_settings: Settings) -> None:
     assert app.state.settings is tmp_settings
     assert isinstance(app.state.library, Library)
     assert isinstance(app.state.playlists, PlaylistStore)
+    assert app.state.port == server_app.DEFAULT_PORT == 8765  # the Redirect URI's port
     jobs = app.state.jobs
     assert jobs.settings is tmp_settings and jobs.library is app.state.library
     assert not jobs.running
@@ -1244,7 +1571,13 @@ def test_pick_port_sees_a_busy_ipv6_port() -> None:
     assert server_app.pick_port("::1", port) == port
 
 
-def test_port_is_free_rejects_unresolvable_hosts() -> None:
+def test_port_is_free_rejects_unresolvable_hosts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Offline: the resolver is told to fail instead of asking a real DNS server."""
+
+    def unresolvable(*args: object, **kwargs: object) -> list[Any]:
+        raise socket.gaierror("Name or service not known")
+
+    monkeypatch.setattr(server_app.socket, "getaddrinfo", unresolvable)
     assert server_app.port_is_free("no-such-host.invalid", 8765) is False
 
 
@@ -1307,6 +1640,21 @@ def test_serve_wires_everything(tmp_settings: Settings, monkeypatch: pytest.Monk
     assert app.state.settings is tmp_settings
     assert kwargs["host"] == "127.0.0.1" and kwargs["port"] == 8766
     assert calls["browser"] == "http://127.0.0.1:8766/"
+    assert app.state.port == 8766  # the Spotify Redirect URI follows the port actually used
+
+
+def test_serve_on_a_fallback_port_names_the_redirect_uri_to_add(
+    tmp_settings: Settings, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import uvicorn
+
+    monkeypatch.setattr(server_app, "configure_logging", lambda: Path("app.log"))
+    monkeypatch.setattr(server_app, "pick_port", lambda host, port: port + 2)
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: None)
+    tmp_settings.spotify_client_id = "abc123"
+    with caplog.at_level(logging.WARNING, logger="ultimate_playlist.server.app"):
+        server_app.serve(tmp_settings, port=8765, open_browser=False)
+    assert "http://127.0.0.1:8767/api/spotify/callback" in caplog.text
 
 
 def test_serve_on_all_interfaces_opens_the_browser_on_loopback(

@@ -58,8 +58,6 @@ def test_defaults() -> None:
     assert s.embed_cover is True
     assert s.js_runtimes == ["deno", "node"]
     assert s.spotify_client_id == ""
-    assert s.spotify_client_secret == ""
-    assert s.has_spotify_credentials is False
 
 
 def test_derived_paths(home: Path, tmp_path: Path) -> None:
@@ -183,7 +181,6 @@ def test_to_dict_is_json_safe(tmp_path: Path) -> None:
         "embed_cover",
         "js_runtimes",
         "spotify_client_id",
-        "spotify_client_secret",
     }
     assert Settings.from_dict(data) == s
 
@@ -196,64 +193,64 @@ def test_save_is_atomic_and_overwrites(tmp_path: Path) -> None:
     assert sorted(p.name for p in tmp_path.iterdir()) == ["config.json"]
 
 
-# -- Spotify credentials -----------------------------------------------------------------------
+# -- Spotify client ID -------------------------------------------------------------------------
 
 
-def test_spotify_credentials_round_trip(tmp_path: Path) -> None:
-    original = Settings(
-        library_dir=tmp_path / "lib", spotify_client_id="abc123", spotify_client_secret="s3cr3t"
-    )
-    assert original.has_spotify_credentials is True
+def test_spotify_client_id_round_trip(tmp_path: Path) -> None:
+    original = Settings(library_dir=tmp_path / "lib", spotify_client_id="abc123")
     path = tmp_path / "config.json"
     original.save(path)
-    data = json.loads(path.read_text(encoding="utf-8"))
-    # config.json is the user's private file: the secret is stored as-is, not masked
-    assert data["spotify_client_id"] == "abc123"
-    assert data["spotify_client_secret"] == "s3cr3t"
-    loaded = Settings.load(path)
-    assert loaded == original
-    assert loaded.spotify_client_secret == "s3cr3t"
+    assert json.loads(path.read_text(encoding="utf-8"))["spotify_client_id"] == "abc123"
+    assert Settings.load(path) == original
 
 
-def test_spotify_credentials_are_stripped_and_tolerant(tmp_path: Path) -> None:
-    s = Settings(spotify_client_id="  abc123 \n", spotify_client_secret="\ts3cr3t ")
-    assert (s.spotify_client_id, s.spotify_client_secret) == ("abc123", "s3cr3t")
-    # a v0.1 config.json has no such keys; a hand-edited one may hold null or a number
+def test_spotify_client_id_is_stripped_and_tolerant(caplog: pytest.LogCaptureFixture) -> None:
+    assert Settings(spotify_client_id="  abc123 \n").spotify_client_id == "abc123"
+    # a v0.1 config.json has no such key; a hand-edited one may hold null, a number or junk
     assert Settings.from_dict({}).spotify_client_id == ""
-    assert Settings.from_dict({"spotify_client_secret": None}).spotify_client_secret == ""
+    assert Settings.from_dict({"spotify_client_id": None}).spotify_client_id == ""
     assert Settings.from_dict({"spotify_client_id": 12345}).spotify_client_id == ""
     assert Settings.from_dict({"spotify_client_id": " x "}).spotify_client_id == "x"
-    assert Settings(spotify_client_id="only-id").has_spotify_credentials is False
-    assert Settings(spotify_client_secret="only-secret").has_spotify_credentials is False
+    with caplog.at_level(logging.WARNING, logger="ultimate_playlist.config"):
+        loaded = Settings.from_dict({"spotify_client_id": "x" * 101, "concurrency": 4})
+    assert loaded.spotify_client_id == ""  # only the broken value is dropped...
+    assert loaded.concurrency == 4  # ...the rest of the file still counts
+    assert "spotify_client_id" in caplog.text
 
 
-def test_public_dict_masks_the_secret(tmp_path: Path) -> None:
-    unset = Settings(library_dir=tmp_path / "lib")
-    assert unset.public_dict() == unset.to_dict()
-    assert unset.public_dict()["spotify_client_secret"] == ""
-    s = Settings(library_dir=tmp_path / "lib", spotify_client_id="id", spotify_client_secret="s3")
-    public = s.public_dict()
-    assert public["spotify_client_secret"] == config.SECRET_MASK == "********"
-    assert public["spotify_client_id"] == "id"  # the id is not sensitive
-    expected = s.to_dict()
-    expected["spotify_client_secret"] = "********"
-    assert public == expected  # everything else is untouched
-    assert "s3" not in json.dumps(public)
-    assert s.spotify_client_secret == "s3"  # public_dict() does not touch the object
+def test_a_config_with_the_old_client_secret_still_loads(tmp_path: Path) -> None:
+    """0.2 stored a Spotify client secret; that route is gone. Such a file must load as before,
+    and the next save must not carry the secret forward."""
+    path = tmp_path / "config.json"
+    old = {
+        "library_dir": str(tmp_path / "lib"),
+        "concurrency": 3,
+        "spotify_client_id": "abc123",
+        "spotify_client_secret": "s3cr3t-value",
+    }
+    path.write_text(json.dumps(old), encoding="utf-8")
+    loaded = Settings.load(path)
+    assert loaded.concurrency == 3 and loaded.spotify_client_id == "abc123"
+    assert not hasattr(loaded, "spotify_client_secret")
+    assert "spotify_client_secret" not in loaded.to_dict()
+    loaded.save(path)
+    text = path.read_text(encoding="utf-8")
+    assert "spotify_client_secret" not in text and "s3cr3t-value" not in text
+    assert Settings.load(path) == loaded
 
 
-def test_clean_credential() -> None:
-    assert config.clean_credential("  abc-123_XYZ.~ ", "Spotify client ID") == "abc-123_XYZ.~"
-    assert config.clean_credential("", "Spotify client ID") == ""
-    assert config.clean_credential("x" * 200, "Spotify client secret") == "x" * 200
+def test_clean_client_id() -> None:
+    assert config.clean_client_id("  abc-123_XYZ.~ ") == "abc-123_XYZ.~"
+    assert config.clean_client_id("") == ""
+    assert config.clean_client_id("x" * 100) == "x" * 100
     with pytest.raises(ValueError, match="too long"):
-        config.clean_credential("x" * 201, "Spotify client secret")
+        config.clean_client_id("x" * 101)
     with pytest.raises(ValueError, match="plain ASCII"):
-        config.clean_credential("ünïcode", "Spotify client ID")
+        config.clean_client_id("ünïcode")
     with pytest.raises(ValueError, match="plain ASCII"):
-        config.clean_credential("tab\there", "Spotify client ID")
-    with pytest.raises(ValueError, match="Spotify client secret"):
-        config.clean_credential("\x00", "Spotify client secret")
+        config.clean_client_id("tab\there")
+    with pytest.raises(ValueError, match="Spotify client ID"):
+        config.clean_client_id("\x00")
 
 
 def test_shared_value_rules() -> None:

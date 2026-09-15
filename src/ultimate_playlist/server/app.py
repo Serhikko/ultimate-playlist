@@ -8,6 +8,8 @@ directly, so nothing in here can be used to read files outside the library folde
 from __future__ import annotations
 
 import dataclasses
+import html
+import json
 import logging
 import mimetypes
 import os
@@ -26,7 +28,7 @@ from urllib.parse import quote, urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
 from starlette.datastructures import Headers
@@ -34,12 +36,12 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .. import __version__, providers
 from ..config import (
-    SECRET_MASK,
     Settings,
+    app_data_dir,
     clean_audio_format,
     clean_audio_quality,
+    clean_client_id,
     clean_concurrency,
-    clean_credential,
     clean_js_runtimes,
 )
 from ..downloader import JobManager
@@ -49,10 +51,12 @@ from ..logs import install_handlers, log_file_path
 from ..models import Job, Playlist
 from ..playlists import PlaylistNotFound, PlaylistStore, export_m3u8, m3u8_text
 from ..providers import run_doctor
+from ..providers.base import ProviderError
 
 log = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+DEFAULT_PORT = 8765  # what `up` serves on (and create_app assumes) unless told otherwise
 PORT_ATTEMPTS = 11  # the requested port plus the next 10
 M3U8_MEDIA_TYPE = "audio/x-mpegurl"
 # The only Host / Origin values a local app should ever see. Anything else is a DNS-rebinding
@@ -84,6 +88,24 @@ _WINDOWS_RESERVED = frozenset(
 # Browsers must not second-guess the declared type of a cover or an audio file.
 NOSNIFF = {"X-Content-Type-Options": "nosniff"}
 
+# Connecting a Spotify account (Authorization Code + PKCE, see providers/spotify_auth.py).
+# The callback path is part of the Redirect URI the user registers, so it never changes
+# (test_api checks it equals spotify_auth.CALLBACK_PATH).
+SPOTIFY_CALLBACK_PATH = "/api/spotify/callback"
+SPOTIFY_TOKEN_FILE = "spotify_auth.json"  # in app_data_dir(); written by spotify_auth only
+SPOTIFY_NO_CLIENT_ID = (
+    "Add your Spotify app's Client ID in Settings first, then click Connect Spotify."
+)
+SPOTIFY_CONNECT_FAILED = "Could not connect Spotify. See app.log for details."
+SPOTIFY_NEEDS_LOOPBACK = (
+    "Connect Spotify only works while the app listens on 127.0.0.1, where Spotify sends the "
+    "browser back. Start the app without --host (or with --host 0.0.0.0) to connect."
+)
+_SPOTIFY_MESSAGE_MAX = 300  # the message ends up in a toast; keep it short
+# The login and callback answers carry a one-time state / code: never cache or refer them.
+NO_STORE = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
+_MASK = "********"
+
 
 # -- request bodies ----------------------------------------------------------------------------
 
@@ -93,11 +115,8 @@ class JobRequest(BaseModel):
 
 
 class SettingsPatch(BaseModel):
-    """Partial settings update; every field is optional and unknown keys are ignored.
-
-    `spotify_client_secret` equal to SECRET_MASK (what GET hands out) means "leave the stored
-    secret alone", so a settings form can be submitted as a whole without knowing the secret.
-    """
+    """Partial settings update; every field is optional and unknown keys are ignored (so a page
+    from a pre-release 0.2 build that still sends `spotify_client_secret` does no harm)."""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -109,7 +128,6 @@ class SettingsPatch(BaseModel):
     embed_cover: bool | None = None
     js_runtimes: list[str] | None = None
     spotify_client_id: str | None = None
-    spotify_client_secret: str | None = None
 
 
 class PlaylistCreate(BaseModel):
@@ -223,17 +241,38 @@ class LoopbackOnlyMiddleware:
         await self.app(scope, receive, send)
 
 
+def _spotify_auth() -> Any:
+    """providers/spotify_auth.py, imported on first use (tests monkeypatch its functions)."""
+    from ..providers import spotify_auth
+
+    return spotify_auth
+
+
+def _stored_spotify_tokens() -> list[str]:
+    """The saved Spotify tokens, read only to scrub them out of provider texts. Never raises."""
+    try:
+        data = json.loads((app_data_dir() / SPOTIFY_TOKEN_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    values = (data.get("access_token"), data.get("refresh_token"))
+    return [v for v in values if isinstance(v, str) and len(v) >= 8]
+
+
 def provider_status(settings: Settings | None = None) -> list[dict[str, Any]]:
     """Doctor checks of every registered provider, in registry order. Never raises.
 
-    Check texts are free-form provider output; the Spotify secret is scrubbed out of them as a
-    safety net, so no provider can ever echo it into the status page.
+    Check texts are free-form provider output; the stored Spotify tokens are scrubbed out of
+    them as a safety net, so no provider can ever echo one into the status page.
     """
-    secret = settings.spotify_client_secret if settings is not None else ""
+    tokens = _stored_spotify_tokens()
 
     def scrub(text: object) -> str:
         value = str(text)
-        return value.replace(secret, SECRET_MASK) if secret else value
+        for token in tokens:
+            value = value.replace(token, _MASK)
+        return value
 
     result: list[dict[str, Any]] = []
     for provider in list(providers.PROVIDERS):
@@ -303,13 +342,7 @@ def _validate_settings_patch(patch: SettingsPatch) -> dict[str, Any]:
     if patch.js_runtimes is not None:
         changes["js_runtimes"] = _clean(clean_js_runtimes, patch.js_runtimes)
     if patch.spotify_client_id is not None:
-        changes["spotify_client_id"] = _clean(
-            clean_credential, patch.spotify_client_id, "Spotify client ID"
-        )
-    if patch.spotify_client_secret is not None and patch.spotify_client_secret != SECRET_MASK:
-        changes["spotify_client_secret"] = _clean(
-            clean_credential, patch.spotify_client_secret, "Spotify client secret"
-        )
+        changes["spotify_client_id"] = _clean(clean_client_id, patch.spotify_client_id)
     return changes
 
 
@@ -321,6 +354,47 @@ def _clean(rule: Any, *args: Any) -> Any:
         raise HTTPException(400, str(exc)) from exc
 
 
+def back_to_app(app_state: Any, *, error: str | None = None) -> RedirectResponse:
+    """303 to the page, which shows the outcome as a toast and then cleans its URL.
+
+    An error message stays on the server (`GET /api/spotify` hands it out once as
+    `last_error`): were it in the URL, any web site could link to the app with a message of its
+    choosing and have it shown as if the app had said it.
+    """
+    if error is None:
+        app_state.spotify_last_error = None
+        target = "/?spotify=connected"
+    else:
+        text = " ".join(error.split())[:_SPOTIFY_MESSAGE_MAX] or SPOTIFY_CONNECT_FAILED
+        app_state.spotify_last_error = text
+        target = "/?spotify=error"
+    return RedirectResponse(target, status_code=303, headers=NO_STORE)
+
+
+def spotify_callback_reachable(host: str) -> bool:
+    """Can Spotify's redirect to 127.0.0.1 reach a server bound to `host`? True for loopback
+    and for every-interface binds; False for one LAN address ("192.168.1.5") or "::1"."""
+    name = (host or "").strip().strip("[]").lower()
+    return name in WILDCARD_BIND_HOSTS or name in ("127.0.0.1", "localhost")
+
+
+def friendly_error(request: Request, message: str, status_code: int) -> Response:
+    """A top-level browser navigation gets a small page; everything else the usual JSON."""
+    if "text/html" not in request.headers.get("accept", ""):
+        return JSONResponse({"detail": message}, status_code=status_code)
+    page = (
+        '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        "<title>Ultimate Playlist</title></head>"
+        '<body style="margin:0;padding:32px 16px;font:15px/1.5 system-ui,sans-serif;'
+        'background:#0d0f14;color:#e8eaf0">'
+        f"<p>{html.escape(message)}</p>"
+        '<p><a href="/" style="color:#5d8dff">Back to Ultimate Playlist</a></p>'
+        "</body></html>"
+    )
+    return HTMLResponse(page, status_code=status_code, headers=NO_STORE)
+
+
 # -- the application ---------------------------------------------------------------------------
 
 
@@ -330,11 +404,16 @@ def create_app(
     playlists: PlaylistStore | None = None,
     jobs: JobManager | None = None,
     allowed_hosts: Sequence[str] = LOOPBACK_HOSTS,
+    port: int = DEFAULT_PORT,
+    spotify_connect_ok: bool = True,
 ) -> FastAPI:
     """Build the app. Objects not passed in are created from `settings` (default: config.json).
 
     `allowed_hosts` are the Host / Origin names the API answers to (loopback by default; pass
-    `["*"]` to accept any, e.g. when deliberately serving on a LAN address).
+    `["*"]` to accept any, e.g. when deliberately serving on a LAN address). `port` is where
+    the server listens (serve() passes the one it picked): the Spotify Redirect URI uses it.
+    `spotify_connect_ok` is False when the server does not listen on 127.0.0.1, where Spotify
+    sends the browser back after Connect Spotify (see spotify_callback_reachable).
     """
     settings = settings if settings is not None else Settings.load()
     library = library if library is not None else Library(settings.library_dir, settings.index_path)
@@ -355,6 +434,9 @@ def create_app(
     app.state.library = library
     app.state.playlists = playlists
     app.state.jobs = jobs
+    app.state.port = port
+    app.state.spotify_connect_ok = spotify_connect_ok
+    app.state.spotify_last_error = None  # set by back_to_app, handed out once by /api/spotify
     app.add_middleware(LoopbackOnlyMiddleware, allowed_hosts=list(allowed_hosts))
 
     if STATIC_DIR.is_dir():
@@ -461,7 +543,7 @@ def create_app(
 
     @app.get("/api/settings")
     def get_settings() -> dict[str, Any]:
-        return settings.public_dict()  # the Spotify secret is masked, see Settings.public_dict
+        return settings.to_dict()
 
     @app.put("/api/settings")
     def put_settings(patch: SettingsPatch) -> dict[str, Any]:
@@ -480,7 +562,12 @@ def create_app(
         moving = new_dir != old_dir
         # Save a copy first: a failed write must not leave the running app on settings that
         # were never persisted (and the Library pointing somewhere else than the JobManager).
+        # The copy keeps the library folder config.json already has unless this request moves
+        # the library: a one-off `up --library X serve` must not be persisted because the user
+        # changed something else in the dialog (the running app keeps using X, though).
         candidate = dataclasses.replace(settings, **changes)
+        if "library_dir" not in changes:
+            candidate = dataclasses.replace(candidate, library_dir=Settings.load().library_dir)
         try:
             candidate.save()
         except OSError as exc:
@@ -504,7 +591,81 @@ def create_app(
             # curation. Track ids are stable, the UI shows the entries as "missing" until the
             # files turn up, and an explicit rescan / delete is where dangling ids are dropped.
             log.info("Library moved to %s (%d change(s) after rescan)", new_dir, changed)
-        return settings.public_dict()
+        return settings.to_dict()
+
+    # -- Spotify account ---------------------------------------------------------------------
+
+    def spotify_redirect_uri() -> str:
+        return str(_spotify_auth().redirect_uri(int(app.state.port)))
+
+    @app.get("/api/spotify")
+    def spotify_state() -> dict[str, Any]:
+        """What the Settings dialog shows. Never a token: SpotifyAccount carries none.
+
+        A sign-in is bound to the Client ID it was issued for: with another one configured
+        the user is not connected (and connected again when the old ID comes back).
+        `connect_ok` is False when Spotify's redirect to 127.0.0.1 cannot reach this server.
+        `last_error` is the message of the last failed Connect Spotify, handed out once (the
+        page shows it after `/?spotify=error`).
+        """
+        account = None
+        if settings.spotify_client_id:
+            try:
+                account = _spotify_auth().current_account(settings.spotify_client_id)
+            except Exception as exc:  # noqa: BLE001 - an unreadable sign-in = not connected
+                log.warning("Could not read the saved Spotify sign-in: %s", exc)
+        last_error, app.state.spotify_last_error = app.state.spotify_last_error, None
+        return {
+            "client_id_set": bool(settings.spotify_client_id),
+            "connected": account is not None,
+            "display_name": (account.display_name or account.user_id) if account else None,
+            "redirect_uri": spotify_redirect_uri(),
+            "connect_ok": bool(app.state.spotify_connect_ok),
+            "last_error": last_error,
+        }
+
+    @app.get("/api/spotify/login", include_in_schema=False)
+    def spotify_login(request: Request) -> Response:
+        """The "Connect Spotify" button navigates here; we send the browser on to Spotify."""
+        if not app.state.spotify_connect_ok:
+            return friendly_error(request, SPOTIFY_NEEDS_LOOPBACK, 400)
+        if not settings.spotify_client_id:
+            return friendly_error(request, SPOTIFY_NO_CLIENT_ID, 400)
+        try:
+            url = _spotify_auth().begin_login(settings.spotify_client_id, spotify_redirect_uri())
+        except ProviderError as exc:
+            return back_to_app(app.state, error=str(exc))
+        return RedirectResponse(url, status_code=302, headers=NO_STORE)
+
+    @app.get(SPOTIFY_CALLBACK_PATH, include_in_schema=False)
+    def spotify_callback(
+        state: str = "", code: str | None = None, error: str | None = None
+    ) -> Response:
+        """Spotify sends the browser back here from its consent page (a plain top-level GET,
+        which LoopbackOnlyMiddleware lets through like any other GET to 127.0.0.1). The
+        user always lands on the app again; the code never appears in a response or a log."""
+
+        def scrub(text: str) -> str:
+            return text.replace(code, _MASK) if code else text
+
+        try:
+            account = _spotify_auth().finish_login(state, code, error)
+        except ProviderError as exc:
+            message = scrub(str(exc)) or SPOTIFY_CONNECT_FAILED
+            log.info("Connecting Spotify failed: %s", message)
+            return back_to_app(app.state, error=message)
+        except Exception as exc:  # noqa: BLE001 - the user gets a message, app.log the reason
+            log.error("Connecting Spotify failed: %s", scrub(f"{type(exc).__name__}: {exc}"))
+            return back_to_app(app.state, error=SPOTIFY_CONNECT_FAILED)
+        log.info("Spotify connected as %s", account.display_name or account.user_id)
+        providers.configure(settings)  # a provider caching a client picks up the account
+        return back_to_app(app.state)
+
+    @app.post("/api/spotify/logout")
+    def spotify_logout() -> dict[str, Any]:
+        _spotify_auth().logout()
+        providers.configure(settings)
+        return {"ok": True}
 
     # -- jobs --------------------------------------------------------------------------------
 
@@ -753,7 +914,7 @@ def open_browser_later(url: str, delay: float = 1.0) -> threading.Timer:
 def serve(
     settings: Settings | None = None,
     host: str = "127.0.0.1",
-    port: int = 8765,
+    port: int = DEFAULT_PORT,
     open_browser: bool = True,
 ) -> None:
     """Run the web app with uvicorn (blocking). Falls back to the next free port if `port` is busy."""
@@ -769,7 +930,25 @@ def serve(
         log.warning("Serving on every network interface (%s); any host name is accepted", host)
     else:
         allowed_hosts = [*LOOPBACK_HOSTS, host]
-    app = create_app(settings, allowed_hosts=allowed_hosts)
+    connect_ok = spotify_callback_reachable(host)
+    app = create_app(
+        settings, allowed_hosts=allowed_hosts, port=chosen, spotify_connect_ok=connect_ok
+    )
+    if not connect_ok and settings.spotify_client_id:
+        log.warning(
+            "Connect Spotify is off: Spotify sends the browser back to http://127.0.0.1:%d%s, "
+            "and the app only listens on %s. Start it without --host to connect.",
+            chosen,
+            SPOTIFY_CALLBACK_PATH,
+            host,
+        )
+    elif chosen != DEFAULT_PORT and settings.spotify_client_id:
+        log.warning(
+            "To connect Spotify on this port, add http://127.0.0.1:%d%s as a Redirect URI "
+            "of your Spotify app.",
+            chosen,
+            SPOTIFY_CALLBACK_PATH,
+        )
     # A wildcard bind address is not something a browser can open; loopback always works.
     browser_host = "127.0.0.1" if host in WILDCARD_BIND_HOSTS else host
     url = f"http://{browser_host}:{chosen}/"

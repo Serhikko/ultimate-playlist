@@ -22,10 +22,9 @@ JS_RUNTIMES: tuple[str, ...] = ("deno", "node", "bun", "quickjs")  # what yt-dlp
 MIN_CONCURRENCY, MAX_CONCURRENCY = 1, 6
 # yt-dlp's preferredquality: 0-10 is a VBR level (0 = best), anything above is a bitrate in kbps.
 _AUDIO_QUALITY_RE = re.compile(r"^\d{1,3}$")
-# What the API and the CLI show instead of a stored Spotify client secret. Sending it back
-# unchanged in a settings update means "keep the secret I already have".
-SECRET_MASK = "********"
-CREDENTIAL_MAX_LENGTH = 200
+# Spotify client IDs are 32 hex characters today; the rule stays loose (any printable ASCII)
+# so a change on Spotify's side cannot lock people out of the field.
+CLIENT_ID_MAX_LENGTH = 100
 
 
 def clean_audio_format(value: str) -> str:
@@ -67,18 +66,20 @@ def clean_js_runtimes(values: list[str]) -> list[str]:
     return list(dict.fromkeys(runtimes))
 
 
-def clean_credential(value: str, label: str) -> str:
-    """A Spotify client id / secret: stripped, printable ASCII, at most 200 characters.
+def clean_client_id(value: str) -> str:
+    """A Spotify client ID: stripped, printable ASCII, at most CLIENT_ID_MAX_LENGTH characters.
 
-    An empty string is fine and means "not set"; nothing else about the value is checked, so a
-    future change on Spotify's side cannot lock people out of the field.
+    An empty string is fine and means "not set". Only the ID of the user's own developer app is
+    ever stored: connecting an account uses Authorization Code + PKCE, which needs no secret.
     """
     text = (value or "").strip()
-    if len(text) > CREDENTIAL_MAX_LENGTH:
-        raise ValueError(f"The {label} is too long (at most {CREDENTIAL_MAX_LENGTH} characters).")
+    if len(text) > CLIENT_ID_MAX_LENGTH:
+        raise ValueError(
+            f"The Spotify client ID is too long (at most {CLIENT_ID_MAX_LENGTH} characters)."
+        )
     if not (text.isascii() and text.isprintable()):
         raise ValueError(
-            f"The {label} can only contain plain ASCII letters, digits and punctuation."
+            "The Spotify client ID can only contain plain ASCII letters, digits and punctuation."
         )
     return text
 
@@ -141,6 +142,15 @@ def _text(value: object) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+def _client_id_or_blank(value: object) -> str:
+    """A stored client ID that breaks the rule (a hand-edited file) is dropped, never fatal."""
+    try:
+        return clean_client_id(_text(value))
+    except ValueError as exc:
+        log.warning("Ignoring spotify_client_id from the config: %s", exc)
+        return ""
+
+
 @dataclass
 class Settings:
     library_dir: Path = field(default_factory=_default_library_dir)
@@ -150,25 +160,19 @@ class Settings:
     concurrency: int = 2
     embed_cover: bool = True
     js_runtimes: list[str] = field(default_factory=lambda: ["deno", "node"])
-    # Optional Spotify developer app (https://developer.spotify.com/dashboard). Not needed for
-    # Spotify links to work; it lifts the size cap on playlists. config.json is a local
-    # per-user file under the app data folder, so the secret is stored there as-is (plain
-    # text), like a browser's cookie jar; it is never logged and the API only ever shows a
-    # mask (SECRET_MASK) for it. Both are "" when unset.
+    # Optional: the Client ID of the user's own Spotify developer app
+    # (https://developer.spotify.com/dashboard). Spotify links work without it; with it the
+    # user can connect their account (Authorization Code + PKCE, no client secret anywhere)
+    # for their own playlists of any size and their Liked Songs. "" when unset. The sign-in
+    # tokens are not settings: providers/spotify_auth.py keeps them in their own file.
     spotify_client_id: str = ""
-    spotify_client_secret: str = ""
 
     def __post_init__(self) -> None:
         self.library_dir = _expand(self.library_dir)
         self.concurrency = max(1, min(int(self.concurrency), 6))
         if self.ffmpeg_path is not None:
             self.ffmpeg_path = str(_expand(self.ffmpeg_path)) if self.ffmpeg_path else None
-        self.spotify_client_id = _text(self.spotify_client_id)
-        self.spotify_client_secret = _text(self.spotify_client_secret)
-
-    @property
-    def has_spotify_credentials(self) -> bool:
-        return bool(self.spotify_client_id and self.spotify_client_secret)
+        self.spotify_client_id = _client_id_or_blank(self.spotify_client_id)
 
     # -- persistence -------------------------------------------------------------------------
 
@@ -198,23 +202,19 @@ class Settings:
         os.replace(tmp, path)
 
     def to_dict(self) -> dict[str, Any]:
-        """Everything, including the Spotify secret: this is what config.json stores."""
+        """What config.json stores, `GET /api/settings` returns and `up config show` prints.
+
+        Nothing in it is secret (the Spotify sign-in tokens live in their own file).
+        """
         data = asdict(self)
         data["library_dir"] = str(self.library_dir)
         return data
 
-    def public_dict(self) -> dict[str, Any]:
-        """`to_dict()` with the Spotify secret replaced by SECRET_MASK ("" when unset).
-
-        What `GET /api/settings` and `up config show` hand out; the real secret never leaves
-        the process.
-        """
-        data = self.to_dict()
-        data["spotify_client_secret"] = SECRET_MASK if self.spotify_client_secret else ""
-        return data
-
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Settings:
+        """Unknown keys are ignored, so older files load fine: the `spotify_client_secret` of
+        pre-release 0.2 builds is simply dropped (and disappears from config.json at the next
+        save)."""
         known = {f.name for f in fields(cls)}
         clean: dict[str, Any] = {}
         for key, value in data.items():

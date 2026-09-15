@@ -4,21 +4,23 @@ Spotify is only ever asked for *metadata* (names, artists, album, cover, duratio
 audio is touched; the audio comes from YouTube Music through the YouTube provider. Two sources:
 
 * ``EmbedClient``: ``https://open.spotify.com/embed/{track|album|playlist}/{id}`` is a public
-  page that needs no credentials. It carries a ``<script id="__NEXT_DATA__">`` JSON blob whose
-  ``props.pageProps.state.data.entity`` is the track / album / playlist. Album and playlist
-  track lists are capped (``EMBED_LIST_CAP``, observed: 100 items), a single track carries no
-  album name and playlist items carry no per-track cover.
-* ``WebApiClient``: the Web API with the user's own developer app (client id + secret, Client
-  Credentials flow). No cap, full metadata (album, ISRC, track number, release year).
+  page that needs no account. It carries a ``<script id="__NEXT_DATA__">`` JSON blob whose
+  ``props.pageProps.state.data.entity`` is the track / album / playlist. Playlist track lists
+  are capped (``EMBED_LIST_CAP``, observed: 100 items), a single track carries no album name
+  and playlist items carry no per-track cover.
+* ``UserApiClient``: the Web API as the account the user connected in Settings
+  (``spotify_auth``: their own developer app's Client ID, Authorization Code + PKCE, no
+  secret). No cap, full metadata (album, ISRC, track number, release year), and the only way
+  to read Liked Songs. Since March 2026 Spotify returns playlist contents only for playlists
+  the user owns or collaborates on; any other playlist is read from its embed page instead.
 
-``get_metadata`` picks the Web API when both credentials are set and the embed page otherwise.
-Everything here is offline-testable: the HTTP session is injectable and ``parse_embed_html`` /
-``parse_spotify_url`` are pure.
+``get_metadata`` uses the Web API when the configured Client ID has a connected account and the
+embed page otherwise. Everything here is offline-testable: the HTTP session is injectable and
+``parse_embed_html`` / ``parse_spotify_url`` are pure.
 """
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import re
@@ -31,7 +33,9 @@ from urllib.parse import urlsplit
 
 import requests
 
+from . import spotify_auth
 from .base import DownloadCancelled, ProviderError
+from .spotify_auth import SpotifyAccount, SpotifyAuthError
 
 log = logging.getLogger(__name__)
 
@@ -41,29 +45,32 @@ USER_AGENT = (
     "Chrome/128.0.0.0 Safari/537.36"
 )
 EMBED_URL = "https://open.spotify.com/embed/{kind}/{id}"
-EMBED_LIST_CAP = 100  # observed: the embed page lists at most this many album/playlist tracks
-TOKEN_URL = "https://accounts.spotify.com/api/token"
+EMBED_LIST_CAP = 100  # observed: the embed page lists at most this many playlist tracks
 API_BASE = "https://api.spotify.com/v1"
-API_PAGE_LIMIT = 50  # the documented maximum for album tracks and playlist items
+API_PAGE_LIMIT = 50  # the documented maximum for album tracks, playlist items and saved tracks
 MAX_PAGES = 400  # 20 000 items: a guard against a `next` loop, not a feature
 HTTP_TIMEOUT = 15.0
 SHORT_LINK_TIMEOUT = 10.0
 RETRY_AFTER_CAP = 30.0
-TOKEN_SAFETY_MARGIN = 60.0  # seconds taken off `expires_in` before asking for a new token
 
 SUPPORTED_KINDS: tuple[str, ...] = ("track", "album", "playlist")
+LIKED_KIND = "liked"  # Liked Songs (open.spotify.com/collection/tracks); Web API only
+LIKED_ID = "tracks"
+LIKED_NAME = "Liked Songs"
+LIKED_URL = "https://open.spotify.com/collection/tracks"
+
 UNSUPPORTED_KINDS_MESSAGE = (
-    "Only Spotify tracks, albums and playlists are supported (not artists, podcasts or profiles)."
+    "Only Spotify tracks, albums, playlists and your Liked Songs are supported (not artists, "
+    "podcasts or profiles)."
 )
 NOT_FOUND_MESSAGE = "That Spotify link does not exist or is private."
 NOT_A_LINK_MESSAGE = "That doesn't look like a Spotify track, album or playlist link."
-CREDENTIALS_MESSAGE = (
-    "Spotify rejected the client id/secret in Settings. Check them at "
-    "developer.spotify.com/dashboard and try again."
-)
-SPOTIFY_MADE_PLAYLIST_MESSAGE = (
-    "Spotify does not let personal apps read this Spotify-made playlist; add the songs to a "
-    "playlist of your own and paste that link."
+LIKED_NEEDS_CONNECTION_MESSAGE = "Connect Spotify in Settings to download your Liked Songs"
+NOT_CONNECTED_MESSAGE = "Spotify is not connected any more. Click Connect Spotify in Settings."
+NOT_YOURS_WARNING = "Spotify only shares the first %d songs of playlists you don't own"
+FORBIDDEN_MESSAGE = (
+    "Spotify refused this request (HTTP 403). Check that your Spotify account is listed under "
+    "User Management of your developer app and that the app owner has Spotify Premium."
 )
 RATE_LIMIT_MESSAGE = "Spotify is rate-limiting us, try again in a minute."
 UNREACHABLE_MESSAGE = "Could not reach Spotify. Check your internet connection and try again."
@@ -82,9 +89,9 @@ _OPEN_URL_RE = re.compile(r"https?://open\.spotify\.com/[^\s\"'<>\\]+")
 _NBSP = "\xa0"  # NO-BREAK SPACE
 
 
-class SpotifyRefused(ProviderError):
-    """The Web API answered 403/404 for a playlist: possibly a Spotify-made playlist that
-    personal apps may not read. `get_metadata` retries those through the public page."""
+class NotYourPlaylist(ProviderError):
+    """The Web API shares no contents for this playlist (the user neither owns it nor
+    collaborates on it, or it is one of Spotify's own). `get_metadata` reads its public page."""
 
 
 # --------------------------------------------------------------------------------------------
@@ -94,9 +101,9 @@ class SpotifyRefused(ProviderError):
 
 @dataclass
 class SpotifyEntity:
-    """A track, or an album / playlist with its tracks. Every optional field may be None."""
+    """A track, or an album / playlist / Liked Songs with its tracks. Optional fields may be None."""
 
-    kind: str  # "track" | "album" | "playlist"
+    kind: str  # "track" | "album" | "playlist" | "liked"
     id: str
     name: str
     artists: list[str] = field(default_factory=list)
@@ -113,6 +120,8 @@ class SpotifyEntity:
 
     @property
     def url(self) -> str:
+        if self.kind == LIKED_KIND:
+            return LIKED_URL
         return f"https://open.spotify.com/{self.kind}/{self.id}"
 
 
@@ -171,7 +180,8 @@ def parse_spotify_url(url: str, session: Any | None = None) -> tuple[str, str]:
     ``/intl-xx/`` prefix, ``/embed/`` segment, old ``/user/<name>/playlist/<id>`` shape, query
     string, trailing slash), ``play.spotify.com``, ``spotify:track:<id>`` URIs (also the old
     ``spotify:user:<name>:playlist:<id>``) and ``spotify.link`` / ``spotify.app.link`` short links
-    (resolved over the network with `session`, default: a fresh requests session).
+    (resolved over the network with `session`, default: a fresh requests session). Liked Songs,
+    ``https://open.spotify.com/collection/tracks``, is ``("liked", "tracks")``.
 
     Raises ProviderError with a friendly message for artists, podcasts, profiles and anything
     that is not a Spotify link.
@@ -181,6 +191,8 @@ def parse_spotify_url(url: str, session: Any | None = None) -> tuple[str, str]:
         raise ProviderError(NOT_A_LINK_MESSAGE)
     uri = _URI_RE.match(text)
     if uri:
+        if uri.group("kind").lower() == "collection" and uri.group("id").lower() == LIKED_ID:
+            return LIKED_KIND, LIKED_ID
         return _kind_and_id(uri.group("kind"), uri.group("id"))
     if text.lower().startswith("spotify:"):
         raise ProviderError(UNSUPPORTED_KINDS_MESSAGE)
@@ -202,6 +214,10 @@ def parse_spotify_url(url: str, session: Any | None = None) -> tuple[str, str]:
         segments = segments[1:]
     if segments and segments[0].lower() in ("embed", "embed-podcast"):
         segments = segments[1:]
+    if segments and segments[0].lower() == "collection":
+        if len(segments) >= 2 and segments[1].lower() == LIKED_ID:
+            return LIKED_KIND, LIKED_ID
+        raise ProviderError(UNSUPPORTED_KINDS_MESSAGE)  # saved albums, podcasts, ...
     if len(segments) >= 4 and segments[0].lower() == "user":
         segments = segments[2:]  # /user/<name>/playlist/<id>
     if len(segments) < 2:
@@ -408,7 +424,7 @@ def parse_embed_html(html: str) -> SpotifyEntity:
 
 
 class EmbedClient:
-    """Reads public embed pages; no credentials involved."""
+    """Reads public embed pages; no account involved."""
 
     def __init__(self, session: Any | None = None, timeout: float = HTTP_TIMEOUT) -> None:
         self._session = session
@@ -421,6 +437,8 @@ class EmbedClient:
         return self._session
 
     def fetch(self, kind: str, entity_id: str) -> SpotifyEntity:
+        if kind == LIKED_KIND:
+            raise SpotifyAuthError(LIKED_NEEDS_CONNECTION_MESSAGE)
         kind, entity_id = _kind_and_id(kind, entity_id)
         url = EMBED_URL.format(kind=kind, id=entity_id)
         headers = {"User-Agent": USER_AGENT, "Accept-Language": "en"}
@@ -438,7 +456,7 @@ class EmbedClient:
         if entity.truncated:
             log.warning(
                 "Spotify's public page lists at most about %d tracks; %s %s may be longer. "
-                "Add a client id and secret in Settings to fetch playlists of any size.",
+                "Connect Spotify in Settings to read your own playlists of any size.",
                 EMBED_LIST_CAP,
                 kind,
                 entity_id,
@@ -447,7 +465,7 @@ class EmbedClient:
 
 
 # --------------------------------------------------------------------------------------------
-# Web API
+# Web API (as the connected user)
 # --------------------------------------------------------------------------------------------
 
 
@@ -474,7 +492,7 @@ def _api_cover(obj: dict[str, Any] | None) -> str | None:
     return best_url
 
 
-def _api_track(track: dict[str, Any], album: dict[str, Any] | None = None) -> SpotifyEntity | None:
+def _api_track(track: Any, album: dict[str, Any] | None = None) -> SpotifyEntity | None:
     """A full or simplified track object -> SpotifyEntity; `album` overrides the track's own."""
     if not isinstance(track, dict) or track.get("is_local"):
         return None
@@ -505,40 +523,34 @@ def _api_track(track: dict[str, Any], album: dict[str, Any] | None = None) -> Sp
     )
 
 
-_PLAYLIST_TRACK_FIELDS = (
-    "id,name,type,is_local,duration_ms,track_number,external_ids(isrc),artists(name),"
-    "album(name,release_date,images(url,width),artists(name))"
-)
-PLAYLIST_ITEMS_FIELDS = (
-    f"next,total,items(is_local,track({_PLAYLIST_TRACK_FIELDS}),item({_PLAYLIST_TRACK_FIELDS}))"
-)
+def _item_track(item: dict[str, Any], *keys: str) -> Any:
+    """The track object of a playlist / saved-track item: the first of `keys` holding a dict."""
+    for key in keys:
+        value = item.get(key)
+        if isinstance(value, dict):
+            return value
+    return None
 
 
-class WebApiClient:
-    """Spotify Web API through the user's own developer app (Client Credentials flow).
+class UserApiClient:
+    """The Spotify Web API as the account connected through `spotify_auth`.
 
-    `session` (anything with ``get``/``post`` like requests.Session), `sleep` and `clock` are
-    injectable for tests. Tokens are cached until shortly before ``expires_in`` runs out.
+    Access tokens come from ``spotify_auth.access_token(client_id)``, which renews them; a 401
+    renews once more and then gives up with SpotifyAuthError. `session` (anything with a
+    requests-style ``get``) and `sleep` are injectable for tests.
     """
 
     def __init__(
         self,
         client_id: str,
-        client_secret: str,
         session: Any | None = None,
         timeout: float = HTTP_TIMEOUT,
         sleep: Callable[[float], None] = time.sleep,
-        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.client_id = (client_id or "").strip()
-        self.client_secret = (client_secret or "").strip()
         self._session = session
         self._timeout = timeout
         self._sleep = sleep
-        self._clock = clock
-        self._token: str | None = None
-        self._token_expires_at = 0.0
-        self._lock = threading.Lock()
 
     @property
     def session(self) -> Any:
@@ -546,53 +558,13 @@ class WebApiClient:
             self._session = requests.Session()
         return self._session
 
-    # -- auth ----------------------------------------------------------------------------------
-
-    def _request_token(self) -> tuple[str, float]:
-        if not self.client_id or not self.client_secret:
-            raise ProviderError(CREDENTIALS_MESSAGE)
-        basic = base64.b64encode(f"{self.client_id}:{self.client_secret}".encode()).decode("ascii")
-        try:
-            resp = self.session.post(
-                TOKEN_URL,
-                data={"grant_type": "client_credentials"},
-                headers={
-                    "Authorization": f"Basic {basic}",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "User-Agent": USER_AGENT,
-                },
-                timeout=self._timeout,
-            )
-        except requests.RequestException as exc:
-            raise ProviderError(UNREACHABLE_MESSAGE) from exc
-        status = int(getattr(resp, "status_code", 0) or 0)
-        if status in (400, 401, 403):
-            raise ProviderError(CREDENTIALS_MESSAGE)
-        if status == 429:
-            raise ProviderError(RATE_LIMIT_MESSAGE)
-        if status != 200:
-            raise ProviderError(
-                f"Spotify's login service answered with HTTP {status}. Try again later."
-            )
-        try:
-            body = resp.json()
-        except ValueError as exc:
-            raise ProviderError("Spotify's login service sent an unreadable answer.") from exc
-        token = body.get("access_token") if isinstance(body, dict) else None
-        if not isinstance(token, str) or not token:
-            raise ProviderError(CREDENTIALS_MESSAGE)
-        expires_in = _int_or_none(body.get("expires_in")) or 3600
-        return token, float(expires_in)
-
-    def token(self, force: bool = False) -> str:
-        with self._lock:
-            if force or self._token is None or self._clock() >= self._token_expires_at:
-                token, expires_in = self._request_token()
-                self._token = token
-                self._token_expires_at = self._clock() + max(30.0, expires_in - TOKEN_SAFETY_MARGIN)
-            return self._token
-
     # -- requests ------------------------------------------------------------------------------
+
+    def _token(self, cancel: threading.Event | None, stale: str | None = None) -> str:
+        token = spotify_auth.access_token(self.client_id, cancel, stale_token=stale)
+        if not token:
+            raise SpotifyAuthError(NOT_CONNECTED_MESSAGE)
+        return token
 
     def _wait_retry_after(self, resp: Any, cancel: threading.Event | None) -> None:
         raw = None
@@ -619,20 +591,24 @@ class WebApiClient:
         url: str,
         params: dict[str, Any] | None = None,
         cancel: threading.Event | None = None,
-        kind: str = "",
+        what: str = "",
     ) -> dict[str, Any]:
+        """GET an API path or URL. `what` ("playlist" / "items" for playlist requests) decides
+        whether a 403/404 means "not your playlist" (NotYourPlaylist) or a plain error."""
         if not url.startswith("http"):
             url = API_BASE + url
+        token = self._token(cancel)
         retried_token = False
         retried_rate = False
         while True:
             if cancel is not None and cancel.is_set():
                 raise DownloadCancelled("Download cancelled")
-            headers = {"Authorization": f"Bearer {self.token()}", "User-Agent": USER_AGENT}
+            headers = {"Authorization": f"Bearer {token}", "User-Agent": USER_AGENT}
             try:
                 resp = self.session.get(url, params=params, headers=headers, timeout=self._timeout)
             except requests.RequestException as exc:
-                raise ProviderError(UNREACHABLE_MESSAGE) from exc
+                log.debug("Spotify API request failed: %s", exc.__class__.__name__)
+                raise ProviderError(UNREACHABLE_MESSAGE) from None
             status = int(getattr(resp, "status_code", 0) or 0)
             if status == 200:
                 try:
@@ -643,24 +619,22 @@ class WebApiClient:
                     raise ProviderError("Spotify sent an unexpected answer. Try again.")
                 return body
             if status == 401 and not retried_token:
-                retried_token = True  # the cached token may just have expired
-                self.token(force=True)
+                retried_token = True  # the token may have been revoked or expired early
+                token = self._token(cancel, stale=token)
                 continue
             if status == 401:
-                raise ProviderError(CREDENTIALS_MESSAGE)
+                raise SpotifyAuthError(spotify_auth.EXPIRED_CONNECTION_MESSAGE)
             if status == 429 and not retried_rate:
                 retried_rate = True
                 self._wait_retry_after(resp, cancel)
                 continue
             if status == 429:
                 raise ProviderError(RATE_LIMIT_MESSAGE)
+            if status in (403, 404) and what in ("playlist", "items"):
+                raise NotYourPlaylist(NOT_YOURS_WARNING % EMBED_LIST_CAP)
             if status == 403:
-                if kind == "playlist":
-                    raise SpotifyRefused(SPOTIFY_MADE_PLAYLIST_MESSAGE)
-                raise ProviderError("Spotify refused this request (HTTP 403).")
+                raise ProviderError(FORBIDDEN_MESSAGE)
             if status in (400, 404):
-                if kind == "playlist":
-                    raise SpotifyRefused(NOT_FOUND_MESSAGE)
                 raise ProviderError(NOT_FOUND_MESSAGE)
             if 500 <= status < 600:
                 raise ProviderError(
@@ -674,15 +648,19 @@ class WebApiClient:
         url: str | None,
         params: dict[str, Any] | None,
         cancel: threading.Event | None,
-        kind: str,
+        what: str,
     ) -> list[dict[str, Any]]:
-        """All `items` of a paging object, following `next` (first page may be given)."""
+        """All `items` of a paging object, following `next` (the first page may be given).
+
+        `next` is only followed to api.spotify.com (the access token goes with it) and for at
+        most MAX_PAGES pages.
+        """
         items: list[dict[str, Any]] = []
         page = first
         pages = 0
         if page is None:
             assert url is not None
-            page = self._get(url, params, cancel, kind)
+            page = self._get(url, params, cancel, what)
         while True:
             pages += 1
             batch = page.get("items")
@@ -690,15 +668,27 @@ class WebApiClient:
                 i for i in (batch if isinstance(batch, list) else []) if isinstance(i, dict)
             )
             next_url = page.get("next")
-            if not isinstance(next_url, str) or not next_url or pages >= MAX_PAGES:
+            if not isinstance(next_url, str) or not next_url:
                 return items
-            page = self._get(next_url, None, cancel, kind)
+            if not next_url.startswith(API_BASE + "/"):
+                log.warning("Not following an unexpected Spotify page link: %s", next_url[:120])
+                return items
+            if pages >= MAX_PAGES:
+                log.warning(
+                    "Stopped reading Spotify after %d pages (%d items); the list may be longer",
+                    pages,
+                    len(items),
+                )
+                return items
+            page = self._get(next_url, None, cancel, what)
 
     # -- entities ------------------------------------------------------------------------------
 
     def fetch(
         self, kind: str, entity_id: str, cancel: threading.Event | None = None
     ) -> SpotifyEntity:
+        if kind == LIKED_KIND:
+            return self._fetch_liked(cancel)
         kind, entity_id = _kind_and_id(kind, entity_id)
         if kind == "track":
             return self._fetch_track(entity_id, cancel)
@@ -753,41 +743,44 @@ class WebApiClient:
         return album
 
     def _fetch_playlist(self, playlist_id: str, cancel: threading.Event | None) -> SpotifyEntity:
-        data = self._get(
-            f"/playlists/{playlist_id}",
-            {"fields": "id,name,images,owner(display_name)"},
-            cancel,
-            "playlist",
-        )
-        name = _clean(data.get("name")) or "Playlist"
+        # No `fields` filter: its absence of `items` is the "not your playlist" signal, and a
+        # filter naming a key Spotify renames would hide that signal.
+        data = self._get(f"/playlists/{playlist_id}", None, cancel, "playlist")
+        contents = data.get("items") if "items" in data else data.get("tracks")
+        if not isinstance(contents, dict):
+            raise NotYourPlaylist(NOT_YOURS_WARNING % EMBED_LIST_CAP)
         owner = data.get("owner") if isinstance(data.get("owner"), dict) else {}
         playlist = SpotifyEntity(
             kind="playlist",
             id=_clean(data.get("id")) or playlist_id,
-            name=name,
-            album_artist=_clean(owner.get("display_name")),
+            name=_clean(data.get("name")) or "Playlist",
+            album_artist=_clean(owner.get("display_name")) or _clean(owner.get("id")),
             cover_url=_api_cover(data),
             source="api",
         )
         items = self._pages(
             None,
-            f"/playlists/{playlist_id}/tracks",
-            {"limit": API_PAGE_LIMIT, "fields": PLAYLIST_ITEMS_FIELDS},
+            f"/playlists/{playlist_id}/items",
+            {"limit": API_PAGE_LIMIT},
             cancel,
-            "playlist",
+            "items",
         )
         for item in items:
             if item.get("is_local"):
                 continue
-            raw = item.get("track")
-            if not isinstance(raw, dict):
-                raw = item.get("item")  # the newer name of the same field
-            if not isinstance(raw, dict):
-                continue
-            track = _api_track(raw)
+            track = _api_track(_item_track(item, "item", "track"))  # "track" is the old name
             if track is not None:
                 playlist.tracks.append(track)
         return playlist
+
+    def _fetch_liked(self, cancel: threading.Event | None) -> SpotifyEntity:
+        items = self._pages(None, "/me/tracks", {"limit": API_PAGE_LIMIT}, cancel, "liked")
+        liked = SpotifyEntity(kind=LIKED_KIND, id=LIKED_ID, name=LIKED_NAME, source="api")
+        for item in items:
+            track = _api_track(_item_track(item, "track", "item"))
+            if track is not None:
+                liked.tracks.append(track)
+        return liked
 
 
 # --------------------------------------------------------------------------------------------
@@ -795,11 +788,21 @@ class WebApiClient:
 # --------------------------------------------------------------------------------------------
 
 
-def credentials_of(settings: Any) -> tuple[str, str]:
-    """(client id, client secret) from the settings; empty strings when unset."""
-    client_id = getattr(settings, "spotify_client_id", "") or ""
-    client_secret = getattr(settings, "spotify_client_secret", "") or ""
-    return str(client_id).strip(), str(client_secret).strip()
+def client_id_of(settings: Any) -> str:
+    """The Spotify Client ID from the settings; "" when unset (or on an old settings object)."""
+    return str(getattr(settings, "spotify_client_id", "") or "").strip()
+
+
+def connected_account(settings: Any) -> SpotifyAccount | None:
+    """The account connected through the configured Client ID, or None. Offline."""
+    client_id = client_id_of(settings)
+    if not client_id:
+        return None
+    try:
+        return spotify_auth.current_account(client_id)
+    except Exception as exc:  # noqa: BLE001 - an unreadable token file means "not connected"
+        log.debug("Could not read the Spotify connection: %s", exc)
+        return None
 
 
 def get_metadata(
@@ -809,23 +812,38 @@ def get_metadata(
     cancel: threading.Event | None = None,
     session: Any | None = None,
 ) -> SpotifyEntity:
-    """The entity through the Web API when credentials are set, else the public embed page.
+    """The entity through the Web API when Spotify is connected, else the public embed page.
 
-    A playlist the API refuses (403, or the 404 Spotify answers for its own editorial
-    playlists) is retried through the public page, which still lists up to EMBED_LIST_CAP
-    tracks; if that fails too the API's explanation is the one raised.
+    Liked Songs need a connection (SpotifyAuthError otherwise) and report any Web API error.
+    A playlist the API shares no contents for (not the user's own, or Spotify-made) is read
+    from its public page, which lists up to EMBED_LIST_CAP songs. So is a track, album or
+    playlist whose Web API request fails for any other reason (an expired connection, a 403
+    once the developer app's owner has no Premium any more, a rate limit, a 5xx, a network
+    error): the public page needs no account, so being connected never makes a link fail that
+    works without a connection. Only a cancel is passed on as it is.
     """
-    client_id, client_secret = credentials_of(settings)
-    if client_id and client_secret:
-        client = WebApiClient(client_id, client_secret, session=session)
-        try:
-            return client.fetch(kind, entity_id, cancel)
-        except SpotifyRefused as exc:
-            log.warning(
-                "Spotify's API refused playlist %s (%s); trying the public page", entity_id, exc
-            )
-            try:
-                return EmbedClient(session=session).fetch(kind, entity_id)
-            except ProviderError:
-                raise exc from None
+    account = connected_account(settings)
+    if kind == LIKED_KIND:
+        if account is None:
+            raise SpotifyAuthError(LIKED_NEEDS_CONNECTION_MESSAGE)
+        return UserApiClient(client_id_of(settings), session=session).fetch(kind, entity_id, cancel)
+    if account is None:
+        return EmbedClient(session=session).fetch(kind, entity_id)
+    try:
+        return UserApiClient(client_id_of(settings), session=session).fetch(kind, entity_id, cancel)
+    except DownloadCancelled:
+        raise
+    except NotYourPlaylist:
+        log.warning(
+            NOT_YOURS_WARNING + "; reading playlist %s from its public page",
+            EMBED_LIST_CAP,
+            entity_id,
+        )
+    except ProviderError as exc:  # SpotifyAuthError included
+        log.warning(
+            "Spotify's Web API failed (%s); reading %s %s from its public page",
+            exc,
+            kind,
+            entity_id,
+        )
     return EmbedClient(session=session).fetch(kind, entity_id)

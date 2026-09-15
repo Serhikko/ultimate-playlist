@@ -22,8 +22,8 @@ macOS, Linux, or running from source: [Requirements](#requirements) onward.
 ## What it does
 
 - Accepts YouTube videos, YouTube Music tracks, playlists, Shorts and `youtu.be` links, and
-  Spotify tracks, albums and playlists (`open.spotify.com` links and `spotify:` URIs, see
-  [Spotify](#spotify)). A YouTube `watch?v=...&list=...` link downloads only that one video; a
+  Spotify tracks, albums, playlists and your Liked Songs (`open.spotify.com` links and
+  `spotify:` URIs, see [Spotify](#spotify)). A YouTube `watch?v=...&list=...` link downloads only that one video; a
   `/playlist?list=...` link downloads the whole playlist (private and deleted entries are
   skipped, the rest are reported per track).
 - Downloads the best available audio and converts it to MP3 (VBR, best quality) with ffmpeg.
@@ -52,42 +52,80 @@ short link works too) exactly like a YouTube link. What happens:
 No Spotify audio is downloaded and no DRM is touched: Spotify is only used for metadata, as if
 you had typed the artist and the title into YouTube Music yourself.
 
-This works without any account: the song lists come from Spotify's public embed pages, which
-list at most 100 songs per playlist. For bigger playlists, create a free Spotify developer app
-and give Ultimate Playlist its credentials:
+### Without a Spotify account
+
+Nothing to set up. The song lists come from Spotify's public pages:
+
+- **tracks** and **albums**: complete;
+- **playlists**: the first 100 songs (the public page lists no more).
+
+### Connect Spotify: your own playlists of any size and your Liked Songs
+
+Connecting your Spotify account lets the app read the playlists you own or collaborate on,
+whatever their size, and your Liked Songs. Connecting works through a small developer app of
+your own. The Spotify account that creates the developer app needs **Spotify Premium**
+(Spotify's rule for developer apps); accounts added to it under User Management do not. You set
+it up once; it is free and takes a few minutes:
 
 1. Open <https://developer.spotify.com/dashboard>, sign in with your Spotify account and click
    **Create app**.
-2. Any name and description, Redirect URI `http://127.0.0.1:8765/`, tick **Web API**, save.
-3. Open the app's **Settings** on the dashboard and copy the **Client ID** and the
-   **Client secret**.
-4. In Ultimate Playlist open **Settings** (the gear icon) and paste them, or from a terminal:
+2. Enter any name and description.
+3. Add the Redirect URI, exactly: `http://127.0.0.1:8765/api/spotify/callback`
+4. Tick **Web API**, accept Spotify's developer terms and click **Save**.
+5. Copy the **Client ID** shown on the app's page.
+6. In Ultimate Playlist open **Settings** (the gear icon), paste the Client ID, click
+   **Connect Spotify** and approve on Spotify's page. You land back in the app, connected.
 
-   ```text
-   uv run up config set spotify_client_id <your client id>
-   uv run up config set spotify_client_secret <your client secret>
-   ```
+No client secret is needed and none is stored: the app uses Spotify's sign-in for apps that
+cannot keep a secret (Authorization Code with PKCE). It only asks to read your playlists and
+your Liked Songs and cannot change anything in your account. The sign-in is saved in
+`spotify_auth.json` in the app data folder (see [Where files go](#where-files-go)); it is only
+ever sent to Spotify and is never shown or logged. **Disconnect** in Settings (or
+`up spotify logout`) deletes it.
 
-   (`.\UltimatePlaylist.exe config set ...` in the no-install version.)
+Once connected:
 
-With the credentials set, playlists of any size are read through the Spotify Web API. The
-credentials are stored in `config.json` in your app data folder and are only ever sent to
-Spotify; the app never shows the secret again (`up config show` prints `********`).
+- **Liked Songs**: click **Download my Liked Songs** in Settings, or paste
+  `https://open.spotify.com/collection/tracks`. Without a connection that link answers
+  "Connect Spotify in Settings to download your Liked Songs".
+- **Your own playlists**, and the ones you collaborate on, are read completely, with album,
+  track number, release year and ISRC for every song. Tracks and albums come from the Web API
+  too. Whenever the Web API refuses or fails (for example once the developer app's owner has no
+  Premium any more), tracks, albums and playlists are read from the public pages instead, as
+  without an account.
+- **Other people's playlists stay capped at 100 songs**, and so do Spotify's own ("Today's Top
+  Hits" and the other editorial or algorithmic playlists): Spotify only lets apps read the
+  contents of playlists you own or collaborate on, so the app reads those from the public page.
+  For the whole list, copy the songs into a playlist of your own (in Spotify: select all,
+  right-click, *Add to playlist*) and paste that one.
+
+If the app runs on a port other than 8765 (8765 was busy, or you started it with
+`up serve --port`), Settings shows the Redirect URI for that port: add it to your developer app
+as well (an app can have several). Connecting only works in a browser on the computer that
+runs the app, and only while the app listens on `127.0.0.1` (the default; with
+`up serve --host <a LAN address>` the Connect button is off). From a terminal, `up spotify status` shows the Client ID, the connected account
+and the Redirect URI, and `up spotify login` prints these steps and opens the running app's
+sign-in (`.\UltimatePlaylist.exe spotify status` in the no-install version).
 
 Good to know:
 
-- **Spotify's own playlists** ("Today's Top Hits", "Rock Classics" and the other editorial or
-  algorithmic playlists, ids starting with `37i9dQZF1`) cannot be read through the Web API by a
-  personal developer app. The account-free route still gives their first 100 songs. For the
-  whole list, copy the songs into a playlist of your own (in Spotify: select all, right-click,
-  *Add to playlist*) and paste that one.
 - **Wrong song matched?** Paste the YouTube link of the right video instead; the app keeps
   both, so delete the wrong one from the Library tab afterwards (tick "also delete file").
 - **"Couldn't find ... on YouTube Music"**: the song is not on YouTube Music in your country,
   or is listed under a different name. The rest of the playlist continues; paste a YouTube link
   for that song.
-- Private playlists cannot be read (the app does not sign in to Spotify). Podcast episodes and
-  local files in a playlist are skipped.
+- **Spotify shows "INVALID_CLIENT: Invalid redirect URI" (or "Invalid client")** and never
+  sends you back: the Redirect URI in your developer app must be exactly the one Settings shows
+  (`127.0.0.1`, not `localhost`, with the port and `/api/spotify/callback`), and the Client ID
+  must be that app's. The app's own "Spotify rejected the login" message appears when Spotify
+  refuses the login afterwards.
+- **"This Spotify account is not allowed to use that developer app"**: you signed in with an
+  account other than the one that created the developer app. Add it under **User Management**
+  on the dashboard (a new developer app admits up to five accounts), or connect with the
+  owner's account.
+- **"Spotify connection expired"**: the sign-in was ended (for example you removed the app's
+  access in your Spotify account). Click **Connect Spotify** again.
+- Podcast episodes and local files in a playlist are skipped.
 
 ## No-install version (Windows)
 
@@ -178,18 +216,28 @@ uv run up add https://www.youtube.com/watch?v=dQw4w9WgXcQ    # download, print p
 uv run up add https://open.spotify.com/album/<id>            # Spotify links work the same way
 uv run up add <url> <url> <url>                              # several links (or a playlist link)
 uv run up add -q <url>                                       # quiet: only the final summary (still waits for the downloads)
-uv run up doctor                                             # check ffmpeg, JS runtime, yt-dlp, Spotify access, folders
+uv run up doctor                                             # check ffmpeg, JS runtime, yt-dlp, folders; show which Spotify route is used
 uv run up list                                               # tracks in the library (id, artist, title, duration, path)
 uv run up list -q daft                                       # search title / artist / album
 uv run up playlists                                          # list playlists
 uv run up export "My playlist"                               # write <library>/Playlists/My playlist.m3u8
 uv run up export "My playlist" D:\Music\mine.m3u8            # ...or to a path of your choice (name or playlist id)
 uv run up rescan                                             # index files you copied into the library folder by hand
-uv run up config show                                        # the current settings (the Spotify secret is masked)
-uv run up config set spotify_client_id <id>                  # change one setting (`up config set --help` lists the keys)
+uv run up config show                                        # the current settings
+uv run up config set concurrency 3                           # change one setting (`up config set --help` lists the keys)
+uv run up spotify status                                     # Client ID, connected account, Redirect URI
+uv run up spotify login                                      # how to connect Spotify; opens the running app's sign-in
+uv run up spotify logout                                     # disconnect Spotify (deletes the saved sign-in)
 uv run up --library D:\Music\UP list                         # use another library folder for this one command
 uv run up --version
 ```
+
+`up config set` and the `up spotify` commands look for the running app on port 8765 and the
+next ten; for an app started with `up serve --port 9000`, add `--port 9000` (`spotify status`
+and `spotify login` then show that port's Redirect URI and open that app's sign-in).
+`config set` and `spotify logout` let the running app make the change, so it takes effect at
+once and the app does not overwrite it with its own copy of the settings. With no app running,
+`config set` writes `config.json` directly.
 
 `uv run up --help` and `uv run up <command> --help` list every flag. `uv run ultimate-playlist`
 and `uv run python -m ultimate_playlist` are the same as `uv run up`.
@@ -202,6 +250,7 @@ and `uv run python -m ultimate_playlist` are the same as `uv run up`.
 | Exported playlists | `<library>/Playlists/<name>.m3u8` |
 | Temporary download files | `<library>/.incoming/` (cleaned up automatically; safe to empty while the app is closed) |
 | Config, index, playlists, log | `~/.ultimate-playlist/` : `config.json`, `library.json`, `playlists.json`, `app.log` |
+| Spotify sign-in (only while connected) | `~/.ultimate-playlist/spotify_auth.json` (plus an empty `spotify_auth.lock`) |
 
 Set the environment variable `ULTIMATE_PLAYLIST_HOME` to move the config/index folder somewhere
 else. The library folder is a setting (`library_dir` in `config.json`, the Settings dialog, or
@@ -212,9 +261,9 @@ else. The library folder is a setting (`library_dir` in `config.json`, the Setti
 VBR), `ffmpeg_path` (only if ffmpeg is not on `PATH`; a path that no longer exists is ignored
 with a warning and `doctor` says so), `concurrency` (parallel downloads, 1..6; a change through
 the Settings dialog resizes the running download pool at once), `embed_cover`, `js_runtimes`
-(`["deno", "node"]`; `bun` and `quickjs` are accepted too), `spotify_client_id` and
-`spotify_client_secret` (both `""` until you add a developer app, see [Spotify](#spotify);
-the secret is stored as-is in this local file and is masked everywhere the app shows settings).
+(`["deno", "node"]`; `bun` and `quickjs` are accepted too) and `spotify_client_id` (`""`
+until you create a Spotify developer app, see [Spotify](#spotify); only the Client ID is
+stored, never a secret).
 A missing or broken file means defaults; the app never refuses to start because of it. Edit it
 while the app is closed, or use `up config set`. The library folder cannot be moved while a
 download is running (the API answers 409).
@@ -237,7 +286,8 @@ restriction for LAN use.
 - For Spotify links, artist (all artists, joined with `, `), title, album and cover come from
   Spotify, whatever the YouTube video was called. Spotify's public pages carry no album name
   for a single track or for the songs of a playlist; there the album of the YouTube Music
-  recording is used (with a developer app the album always comes from Spotify).
+  recording is used (with Spotify connected, the album of your own playlists' songs comes from
+  Spotify too).
 - Characters Windows does not allow in file names are dropped, names are capped at 150
   characters, and a clash with a different track gets ` (2)`, ` (3)`, ... appended.
 - Tags are ID3v2: artist, title, album (when known), comment = the source URL (the YouTube
@@ -276,7 +326,7 @@ section above; the commands below assume a source checkout.
   message says what YouTube said. The app does not sign in to YouTube, so private and
   age-restricted videos cannot be downloaded.
 - **Spotify: "Couldn't find ... on YouTube Music"**, a wrong song, a playlist that stops at 100
-  songs, or a Spotify-made playlist: see [Spotify](#spotify).
+  songs, or trouble connecting your Spotify account: see [Spotify](#spotify).
 - **"Could not reach Spotify"**: no internet, or Spotify is down; the YouTube side is not
   involved yet at that point. Try again in a minute.
 - **Long paths on Windows**: Windows refuses paths longer than 260 characters unless long paths
@@ -298,8 +348,9 @@ section above; the commands below assume a source checkout.
 - **Logs**: `~/.ultimate-playlist/app.log` (rotated, 1 MB x 3). With `up serve` the terminal
   shows the startup lines, one line per Spotify track naming the YouTube video it was matched
   to, plus warnings and errors; the CLI commands only print warnings and errors. yt-dlp's own
-  messages and routine request lines go to the log file only. Please attach the relevant part
-  when reporting a problem (the Spotify secret is never written to it).
+  messages go to the log file only; successful web requests are not logged at all (failed ones
+  are). Please attach the relevant part when reporting a problem (the Spotify sign-in is never
+  written to it).
 
 ## Legal
 
@@ -313,12 +364,14 @@ it. The app uploads nothing and shares nothing; everything stays on your machine
 ## Status
 
 - **0.2**: YouTube (videos, YouTube Music tracks, playlists, Shorts) and Spotify (tracks, albums,
-  playlists; audio from YouTube Music). Local web UI with a settings dialog, the `up` command
-  line, playlists, M3U8 export, built-in player, Windows no-install zip.
+  playlists, Liked Songs with a connected account; audio from YouTube Music). Local web UI with
+  a settings dialog, the `up` command line, playlists, M3U8 export, built-in player, Windows
+  no-install zip.
 - Not yet: a song downloaded once from a YouTube link and once from a Spotify link is two files
-  (no cross-source de-duplication); whole YouTube channels; signing in to YouTube or Spotify
-  (private and age-restricted content); formats other than MP3 (the setting exists but only MP3
-  is tested); per-artist sub-folders.
+  (no cross-source de-duplication); whole YouTube channels; signing in to YouTube (private and
+  age-restricted videos); other people's Spotify playlists beyond their first 100 songs (a
+  Spotify rule); formats other than MP3 (the setting exists but only MP3 is tested); per-artist
+  sub-folders.
 
 ## Development
 

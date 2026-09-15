@@ -363,6 +363,298 @@ def test_threshold_boundaries(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # ----------------------------------------------------------------------------------------------
+# regressions: variant recordings, look-alike artists, absurd lengths, longer titles
+# ----------------------------------------------------------------------------------------------
+
+STUDIO = "Song"
+
+
+def studio(
+    title: str = STUDIO, channel: str = "Artist - Topic", duration: float = 200.0
+) -> Candidate:
+    return cand("studio", title, channel=channel, duration=duration, source="music")
+
+
+def scored_for(title: str, candidate: Candidate, artists: list[str] | None = None) -> Scored:
+    return score_candidate(candidate, title, artists or ["Artist"], 200.0)
+
+
+@pytest.mark.parametrize(
+    "spotify_title",
+    [
+        "Song - Acoustic Version",
+        "Song (Live Version)",
+        "Song (Instrumental Version)",
+        "Song - Live at Wembley 1986",
+        "Song - Club Mix",
+        "Song (DJ Y Remix)",
+        "Song - Demo",
+        "Song - 1995 Demo",
+        "Song - Piano Version",
+        "Song - Unplugged",
+        "Song - Stripped",
+        "Song - A Cappella",
+        "Song - Orchestral Version",
+    ],
+)
+def test_studio_recording_never_matches_a_variant_track(spotify_title: str) -> None:
+    scored = scored_for(spotify_title, studio())
+    assert not scored.accepted, scored
+    assert any(p.startswith("missing ") for p in scored.penalties)
+    assert match_with([studio()], ref(title=spotify_title, artist="Artist", duration=200.0)) is None
+
+
+def test_variant_track_matches_its_own_recording() -> None:
+    cases = [
+        ("Song - Acoustic Version", "Song (Acoustic Version)"),
+        ("Song (Live Version)", "Song (Live)"),
+        ("Song - Live at Wembley 1986", "Song (Live at Wembley 1986)"),
+        ("Song - Club Mix", "Song (Club Mix)"),
+        ("Song (DJ Y Remix)", "Song (DJ Y Remix)"),
+        ("Song - Demo", "Song (Demo)"),
+        # live uploads spell the concert out; "Unplugged" counts as live
+        ("Song - Live", "Song (Live On MTV Unplugged, 1993)"),
+        ("Song - Live In Paris", "Song (Live In Paris, France, 27 February 1979)"),
+    ]
+    for spotify_title, candidate_title in cases:
+        scored = scored_for(spotify_title, studio(candidate_title))
+        assert scored.accepted, (spotify_title, scored)
+        assert scored.penalties == []
+    # when both are offered, the live track picks the live recording whatever the order
+    the_ref = ref(title="Song - Live", artist="Artist", duration=200.0)
+    match = match_with([studio(), cand("live", "Song (Live)", "Artist - Topic", 201)], the_ref)
+    assert match is not None and match.video_id == "live"
+
+
+@pytest.mark.parametrize(
+    "spotify_title",
+    [
+        "Song - Remastered 2011",
+        "Song (2015 Remaster)",
+        "Song (Album Version)",
+        "Song (Single Version)",
+        "Song (Radio Edit)",
+        "Song - Radio Edit",
+        "Song - Edit",
+        "Song - Extended Version",
+        "Song - 2009 Stereo Mix",
+        "Song - Original Mix",
+        "Song - Mono",
+        'Song - From "Some Film"',
+        "Song - Explicit Ver.",
+        "Song (Deluxe Edition)",
+    ],
+)
+def test_edition_markers_still_match_the_plain_recording(spotify_title: str) -> None:
+    scored = scored_for(spotify_title, studio())
+    assert scored.accepted, scored
+    assert scored.title_similarity == 1.0
+    assert scored.penalties == [] and scored.extra_words == []
+
+
+def test_edition_tail_after_a_bracket_is_stripped() -> None:
+    # the last " - " counts, so a bracket in the song name does not hide the edition tail
+    assert (
+        ym.title_similarity(
+            "I Want You (She's So Heavy) - Remastered 2009",
+            "I Want You (She's So Heavy)",
+            ["The Beatles"],
+        )
+        == 1.0
+    )
+    # ...and the candidate side drops one too
+    assert ym.title_similarity("Hotel California", "Hotel California - 2013 Remaster", ["E"]) == 1.0
+
+
+def test_variant_penalties_are_symmetric() -> None:
+    assert ym.variant_penalties("Song - Live", "Song") == ["missing live"]
+    assert ym.variant_penalties("Song (DJ Y Remix)", "Song") == ["missing remix"]
+    assert ym.variant_penalties("Song - Club Mix", "Song") == ["missing mix"]
+    assert ym.variant_penalties("Song - Live", "Song (Acoustic)") == ["acoustic", "missing live"]
+    assert ym.variant_penalties("Song - Live", "Song (Live at MTV Unplugged)") == []
+    assert ym.variant_penalties("Song - Remix", "Song (Club Mix)") == []
+    # "edit" / "extended" on the Spotify side alone: the plain single may still be it
+    assert ym.variant_penalties("Song - Edit", "Song") == []
+    assert ym.variant_penalties("Song - Extended Version", "Song") == []
+    # edition phrases are not variants on either side
+    assert ym.variant_penalties("Song", "Song (Radio Edit)") == []
+    assert ym.variant_penalties("Song - 2009 Stereo Mix", "Song") == []
+    # a variant word that is part of the song name is in both titles
+    assert ym.variant_penalties("Live Forever", "Live Forever") == []
+    assert ym.variant_penalties("Golden Hour", "Golden Hour") == []
+    # a credit or the band's name is not a variant ("Live" the band, "feat. Cover Drive")
+    assert ym.variant_penalties("Lightning Crashes", "Live - Lightning Crashes", ["Live"]) == []
+    assert ym.variant_penalties("Song (feat. Cover Drive)", "Song (feat. Cover Drive)") == []
+
+
+def test_a_variant_word_in_the_song_name_does_not_hide_a_live_recording() -> None:
+    """Occurrences are counted: the "live" of "Live Forever" does not excuse a second one."""
+    assert ym.variant_penalties("Live Forever", "Live Forever (Live at Knebworth)") == ["live"]
+    assert ym.variant_penalties("Live Forever - Live", "Live Forever") == ["missing live"]
+    assert ym.variant_penalties("Live Forever - Live", "Live Forever (Live at Knebworth)") == []
+    assert ym.variant_penalties("Live and Let Die", "Live and Let Die (Live)") == ["live"]
+    assert ym.variant_penalties("Mix Tape", "Mix Tape (Club Mix)") == ["mix"]
+    assert ym.variant_penalties("Demo Song", "Demo Song (Demo)") == ["demo"]
+
+    knebworth = cand("kneb", "Live Forever (Live at Knebworth)", "Oasis - Topic", 280.0)
+    scored = score(knebworth, "Live Forever", ["Oasis"], 276.0)
+    assert scored.penalties == ["live"] and not scored.accepted
+    assert match_with([knebworth], ref(title="Live Forever", artist="Oasis", duration=276)) is None
+    studio_take = cand("studio", "Live Forever", "Oasis - Topic", 276.0)
+    assert not score(studio_take, "Live Forever - Live", ["Oasis"], 276.0).accepted
+    assert score(studio_take, "Live Forever", ["Oasis"], 276.0).accepted
+
+
+@pytest.mark.parametrize(
+    ("spotify_title", "candidate_title"),
+    [
+        ("Roar", "Roar (Spanish Version)"),
+        ("Roar", "Roar - Spanish Version"),
+        ("Roar - Spanish Version", "Roar"),
+        ("Sweater Weather", "Sweater Weather (Alternate Version)"),
+        ("Love Story", "Love Story (Taylor's Version)"),
+        ("Love Story (Taylor's Version)", "Love Story"),
+        ("Song", "Song (Japanese Ver.)"),
+    ],
+)
+def test_another_version_is_another_recording(spotify_title: str, candidate_title: str) -> None:
+    """A bare "Version" is no edition label: language, alternate and re-recorded versions
+    stay in the title and count as extra words."""
+    scored = scored_for(spotify_title, studio(candidate_title))
+    assert not scored.accepted, scored
+    assert scored.extra_words, scored
+
+
+def test_qualified_version_labels_still_match() -> None:
+    for label in ("Album Version", "Single Version", "2011 Version", "Clean Version"):
+        scored = scored_for("Song", studio(f"Song ({label})"))
+        assert scored.accepted and scored.extra_words == [], (label, scored)
+    # a re-recording finds itself
+    taylors = "Love Story (Taylor's Version)"
+    scored = scored_for(taylors, studio(taylors))
+    assert scored.accepted and scored.title_similarity == 1.0 and scored.extra_words == []
+
+
+def test_clean_edition_matches_the_plain_title() -> None:
+    clean = cand("clean", "Roar (Clean)", "Katy Perry - Topic", 223.0, source="music")
+    scored = score(clean, "Roar", ["Katy Perry"], 223.0)
+    assert scored.accepted and scored.extra_words == [] and scored.penalties == []
+    assert scored_for("Song - Clean", studio()).accepted
+
+
+@pytest.mark.parametrize(
+    ("suffix", "word"),
+    [
+        ("(Demo)", "demo"),
+        ("(Piano Version)", "piano"),
+        ("(Unplugged)", "unplugged"),
+        ("(Stripped)", "stripped"),
+        ("(A Cappella)", "a cappella"),
+        ("(Acapella)", "a cappella"),
+        ("(Orchestral Version)", "orchestral"),
+        ("(Lo-Fi)", "lofi"),
+        ("lofi beats", "lofi"),
+        ("(1 Hour)", "hour"),
+        ("10 Hours", "hour"),
+        ("(Loop)", "loop"),
+    ],
+)
+def test_new_variant_words(suffix: str, word: str) -> None:
+    assert word in ym.variant_penalties(TITLE, f"{TITLE} {suffix}")
+    assert match_with([cand("x", f"{TITLE} {suffix}")]) is None
+
+
+def test_endless_uploads_rejected_when_the_spotify_duration_is_unknown() -> None:
+    loop = cand("loop", TITLE, duration=36000)  # a 10-hour upload titled like the song
+    assert score(loop, duration=None).score == 1.0
+    assert not score(loop, duration=None).accepted
+    assert match_with([loop], ref(duration=None)) is None
+    long_but_fine = cand("ok", TITLE, duration=ym.MAX_LENGTH_WITHOUT_DURATION)
+    assert score(long_but_fine, duration=None).accepted
+    # a known Spotify duration already rules such uploads out by the delta
+    assert not score(loop).accepted
+
+
+@pytest.mark.parametrize(
+    ("spotify_artist", "channel"),
+    [
+        ("Adele", "Adeleine"),
+        ("Nas", "Nasty C"),
+        ("Nas", "Lil Nas X"),
+        ("Kanye West", "Ye"),
+        ("Queen", "Queen Latifah"),
+        ("Future", "Future Islands"),
+    ],
+)
+def test_a_name_inside_another_name_is_another_artist(spotify_artist: str, channel: str) -> None:
+    assert ym.artist_similarity([spotify_artist], [channel]) < ym.MIN_ARTIST_SIMILARITY
+    the_ref = ref(title="Song", artist=spotify_artist, duration=200.0)
+    assert match_with([studio(channel=f"{channel} - Topic")], the_ref) is None
+    assert match_with([studio(channel=channel)], the_ref) is None
+
+
+@pytest.mark.parametrize(
+    ("spotify_artist", "channel"),
+    [
+        ("Ariana Grande", "ArianaGrandeVevo"),
+        ("Sam Fender", "Sam Fender Official"),
+        ("Daft Punk", "Official Daft Punk"),
+        ("The Weeknd", "Weeknd"),
+        ("Bruce Springsteen & The E Street Band", "Bruce Springsteen"),
+        ("Tom Petty", "Tom Petty and the Heartbreakers"),
+        ("Yusuf / Cat Stevens", "Cat Stevens"),
+    ],
+)
+def test_decorated_channel_names_still_match(spotify_artist: str, channel: str) -> None:
+    assert ym.artist_similarity([spotify_artist], [channel]) >= 0.9
+    the_ref = ref(title="Song", artist=spotify_artist, duration=200.0)
+    assert match_with([studio(channel=channel)], the_ref) is not None
+
+
+def test_longer_title_by_the_same_artist_is_another_song() -> None:
+    for other in ("Stay With Me", "Stay, Pt. 2", "Stay (Part II)", "Stay 2"):
+        scored = scored_for("Stay", studio(other))
+        assert scored.extra_words, other
+        assert not scored.accepted, (other, scored)
+        assert match_with([studio(other)], ref(title="Stay", artist="Artist", duration=200)) is None
+    # ...and the other way round ("Song 2" is its own song, even at 0.8 letter similarity)
+    for spotify_title, other in (
+        ("Stay With Me", "Stay"),
+        ("Stay, Pt. 2", "Stay"),
+        ("Song 2", "Song"),
+    ):
+        assert not scored_for(spotify_title, studio(other)).accepted, spotify_title
+    assert ym.title_extra_words("Stay", "Stay With Me", ["Artist"]) == ["me", "with"]
+    assert ym.title_extra_words("Stay, Pt. 2", "Stay", ["Artist"]) == ["2", "part"]
+    # "Pt." and "Part", "II" and "2" are one spelling; a different part number is not
+    assert ym.title_extra_words("Stay, Pt. 2", "Stay (Part II)", ["Artist"]) == []
+    assert ym.title_extra_words("Stay, Pt. 1", "Stay (Part I)", ["Artist"]) == []
+    assert not scored_for("Stay, Pt. 2", studio("Stay, Pt. 3")).accepted
+    # the artist's own name in a title is not an extra word
+    assert ym.title_extra_words("Stay", "Stay Artist", ["Artist"]) == []
+
+
+def test_extra_words_that_do_not_name_another_song_are_fine() -> None:
+    accepted = [
+        ("Stay", "Stay (Official Video)", "Artist"),
+        ("Stay", "Artist - Stay (Lyrics)", "Some Uploader"),
+        ("Stay", "Stay (2015 Remaster)", "Artist - Topic"),
+        ("Stay", "Stay (feat. Someone)", "Artist - Topic"),
+        ("Stay", "Stay (with Someone)", "Artist - Topic"),
+        ("Stay (feat. Someone)", "Stay", "Artist - Topic"),
+        ("Stay - Live", "Stay (Live at Wembley 1986)", "Artist - Topic"),
+        ("Stay (Part II)", "Stay, Pt. II", "Artist - Topic"),
+        ("Stay, Pt. 2", "Stay (Part 2)", "Artist - Topic"),
+        ("Don't Stop Me Now", "Dont Stop Me Now", "Artist - Topic"),
+        ("Seven (feat. Someone)", "Seven (feat. Someone) (Explicit Ver.)", "Artist - Topic"),
+    ]
+    for spotify_title, candidate_title, channel in accepted:
+        candidate = cand("v", candidate_title, channel=channel, duration=200)
+        scored = scored_for(spotify_title, candidate)
+        assert scored.accepted, (spotify_title, candidate_title, scored)
+
+
+# ----------------------------------------------------------------------------------------------
 # queries and find_match plumbing
 # ----------------------------------------------------------------------------------------------
 

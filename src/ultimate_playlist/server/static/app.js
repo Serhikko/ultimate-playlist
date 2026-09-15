@@ -219,9 +219,10 @@
 
   const dialogEl = $('#dialog');
 
-  function openDialog({ title, body, confirmLabel = 'OK', cancelLabel = 'Cancel', danger = false, focus = null }) {
+  function openDialog({ title, body, confirmLabel = 'OK', cancelLabel = 'Cancel', danger = false, focus = null, wide = false }) {
     return new Promise((resolve) => {
       clear(dialogEl);
+      dialogEl.classList.toggle('dialog-wide', Boolean(wide));
       let settled = false;
       const done = (value) => {
         if (settled) return;
@@ -535,9 +536,10 @@
 
   // ================================================================ Settings
 
-  // What GET /api/settings returns in place of a stored Spotify secret; sending it back means
-  // "keep the one you have", so the form can be saved without ever seeing the real value.
-  const SECRET_MASK = '********';
+  // Liked Songs has no playlist id: this is the address Spotify itself uses for it.
+  const SPOTIFY_LIKED_SONGS_URL = 'https://open.spotify.com/collection/tracks';
+  const SPOTIFY_DASHBOARD_URL = 'https://developer.spotify.com/dashboard';
+  const USUAL_PORT = '8765';
 
   function settingsField(labelText, input, note) {
     return el(
@@ -572,10 +574,23 @@
     }
   }
 
+  /** Copy a read-only field; without clipboard access, select it so Ctrl+C does the rest. */
+  async function copyField(input) {
+    try {
+      await navigator.clipboard.writeText(input.value);
+      toast('Copied', 'success', 1500);
+    } catch (_err) {
+      input.focus();
+      input.select();
+      toast('Press Ctrl+C to copy', 'info');
+    }
+  }
+
   async function settingsDialog() {
     let current;
+    let spotify;
     try {
-      current = await api('/api/settings');
+      [current, spotify] = await Promise.all([api('/api/settings'), api('/api/spotify')]);
     } catch (err) {
       showError(err);
       return;
@@ -587,29 +602,28 @@
       el('input', { type: 'number', class: 'input input-num', value: String(current.concurrency || 2), min: 1, max: 6, step: 1, required: true }),
     );
     const idInput = submitOnEnter(
-      el('input', { type: 'text', class: 'input', value: current.spotify_client_id || '', maxLength: 200, spellcheck: false, autocomplete: 'off', placeholder: 'optional' }),
+      el('input', { type: 'text', class: 'input', value: current.spotify_client_id || '', maxLength: 100, spellcheck: false, autocomplete: 'off', placeholder: 'optional' }),
     );
-    const secretInput = submitOnEnter(
-      el('input', { type: 'password', class: 'input', value: current.spotify_client_secret || '', maxLength: 200, autocomplete: 'new-password', placeholder: 'optional' }),
-    );
-    const body = [
-      settingsField('Library folder', libraryInput, 'The app creates it if needed; changing it re-scans the new folder.'),
-      settingsField('Parallel downloads (1–6)', concurrencyInput),
-      settingsField('Spotify client ID', idInput),
-      settingsField('Spotify client secret', secretInput),
-      el(
-        'p',
-        { class: 'help' },
-        'Not required. Without it Spotify links work through Spotify’s public pages (tracks, albums, playlists up to about 100 songs). For bigger playlists create a free app at ',
-        el('a', { href: 'https://developer.spotify.com/dashboard', target: '_blank', rel: 'noopener noreferrer', text: 'https://developer.spotify.com/dashboard' }),
-        ' (any name, redirect URI http://127.0.0.1:8765/), then paste its Client ID and Client secret here.',
-      ),
-    ];
-    // The inputs are the same DOM nodes on every round, so a rejected value stays on screen
-    // for the user to fix instead of being wiped by the retry.
-    for (;;) {
-      const ok = await openDialog({ title: 'Settings', body, confirmLabel: 'Save', focus: libraryInput });
-      if (!ok) return;
+    const redirectUri = String(spotify.redirect_uri || '');
+    const redirectInput = el('input', {
+      type: 'text',
+      class: 'input input-mono',
+      value: redirectUri,
+      readOnly: true,
+      spellcheck: false,
+      'aria-label': 'Redirect URI',
+      onfocus: (event) => event.target.select(),
+    });
+    let port = '';
+    try {
+      port = new URL(redirectUri).port;
+    } catch (_err) {
+      port = '';
+    }
+    const spotifyBox = el('div', { class: 'spotify-account' });
+
+    /** Every field that differs from what the server has. */
+    function collectPatch() {
       const patch = {};
       const libraryDir = libraryInput.value.trim();
       if (libraryDir !== String(current.library_dir || '')) patch.library_dir = libraryDir;
@@ -617,26 +631,171 @@
       if (concurrency !== Number(current.concurrency)) patch.concurrency = concurrency;
       const clientId = idInput.value.trim();
       if (clientId !== String(current.spotify_client_id || '')) patch.spotify_client_id = clientId;
-      const secret = secretInput.value.trim();
-      // Untouched, the field still holds the mask: the server would treat that as "unchanged" too.
-      if (secret !== SECRET_MASK && secret !== String(current.spotify_client_secret || '')) patch.spotify_client_secret = secret;
+      return patch;
+    }
+
+    async function savePatch(patch) {
+      current = await api('/api/settings', { method: 'PUT', body: patch });
+      loadStatus();
+      if ('library_dir' in patch) {
+        reloadTracks();
+        loadPlaylists();
+      }
+    }
+
+    // The Client ID is saved first (the server reads it from the settings), then the browser
+    // goes to Spotify's consent page and comes back to /?spotify=connected (see init).
+    async function connectSpotify() {
+      if (!idInput.value.trim()) {
+        toast('Paste the Client ID of your Spotify app first', 'info');
+        idInput.focus();
+        return;
+      }
+      const patch = collectPatch();
+      try {
+        if (Object.keys(patch).length) await savePatch(patch);
+      } catch (err) {
+        showError(err);
+        return;
+      }
+      window.location.assign('/api/spotify/login');
+    }
+
+    async function disconnectSpotify() {
+      try {
+        await api('/api/spotify/logout', { method: 'POST' });
+        spotify = await api('/api/spotify');
+        renderSpotifyBox();
+        toast('Spotify disconnected', 'success');
+        loadStatus();
+      } catch (err) {
+        showError(err);
+      }
+    }
+
+    async function downloadLikedSongs() {
+      try {
+        await api('/api/jobs', { method: 'POST', body: { url: SPOTIFY_LIKED_SONGS_URL } });
+        toast('Your Liked Songs were added to the queue', 'success');
+        dialogEl.close(); // show the queue; nothing typed in the dialog is saved
+        pollJobs();
+      } catch (err) {
+        showError(err);
+      }
+    }
+
+    function renderSpotifyBox() {
+      clear(spotifyBox);
+      if (spotify.connected) {
+        spotifyBox.append(
+          el(
+            'div',
+            { class: 'spotify-status' },
+            icon('check'),
+            el('span', { text: `Connected as ${spotify.display_name || 'your Spotify account'}` }),
+            el('span', { class: 'muted', text: '·' }),
+            el('button', { type: 'button', class: 'btn-link', text: 'Disconnect', onclick: disconnectSpotify }),
+          ),
+          el(
+            'div',
+            { class: 'spotify-actions' },
+            el('button', { type: 'button', class: 'btn btn-sm btn-primary', onclick: downloadLikedSongs }, icon('download'), 'Download my Liked Songs'),
+          ),
+        );
+      } else {
+        // Spotify sends the browser back to 127.0.0.1: an app serving on one LAN address only
+        // (`up serve --host 192.168.x.x`) could never finish the sign-in.
+        const connectOk = spotify.connect_ok !== false;
+        spotifyBox.append(
+          el(
+            'div',
+            { class: 'spotify-actions' },
+            el('button', { type: 'button', class: 'btn btn-sm', onclick: connectSpotify, disabled: !connectOk }, icon('link'), 'Connect Spotify'),
+            el('span', { class: 'field-note muted', text: connectOk ? 'Not connected' : 'Start the app on 127.0.0.1 to connect Spotify' }),
+          ),
+        );
+      }
+    }
+    renderSpotifyBox();
+
+    const portNote =
+      port && port !== USUAL_PORT
+        ? el('p', {
+            class: 'help help-warn',
+            text: `The app is running on port ${port} this time (not the usual ${USUAL_PORT}), so the Redirect URI above uses ${port}. Add it to your Spotify app too (an app can have several Redirect URIs), otherwise Spotify refuses the connection.`,
+          })
+        : null;
+    const body = [
+      settingsField('Library folder', libraryInput, 'The app creates it if needed; changing it re-scans the new folder.'),
+      settingsField('Parallel downloads (1–6)', concurrencyInput),
+      el(
+        'div',
+        { class: 'settings-section' },
+        el('h4', { class: 'section-title', text: 'Spotify' }),
+        el(
+          'p',
+          { class: 'help' },
+          'Optional. Without it Spotify links use Spotify’s public pages: tracks, albums, and playlists up to 100 songs. To download your own playlists of any size and your Liked Songs: create a free app at ',
+          el('a', { href: SPOTIFY_DASHBOARD_URL, target: '_blank', rel: 'noopener noreferrer', text: SPOTIFY_DASHBOARD_URL }),
+          ' (the app’s owner needs Spotify Premium), add the Redirect URI below, tick Web API, then paste its Client ID here and click Connect Spotify.',
+        ),
+        el(
+          'div',
+          { class: 'field' },
+          el('span', { class: 'field-label', text: 'Redirect URI' }),
+          el(
+            'div',
+            { class: 'copy-row' },
+            redirectInput,
+            el('button', { type: 'button', class: 'btn btn-sm', title: 'Copy the Redirect URI', onclick: () => copyField(redirectInput) }, 'Copy'),
+          ),
+        ),
+        portNote,
+        settingsField('Client ID', idInput, spotify.connected ? 'You are connected through this Client ID; another one needs Connect Spotify again.' : null),
+        spotifyBox,
+      ),
+    ];
+    // The inputs are the same DOM nodes on every round, so a rejected value stays on screen
+    // for the user to fix instead of being wiped by the retry.
+    for (;;) {
+      const ok = await openDialog({ title: 'Settings', body, confirmLabel: 'Save', focus: libraryInput, wide: true });
+      if (!ok) return;
+      const patch = collectPatch();
       if (!Object.keys(patch).length) {
         toast('Nothing changed', 'info');
         return;
       }
       try {
-        current = await api('/api/settings', { method: 'PUT', body: patch });
+        await savePatch(patch);
         toast('Settings saved', 'success');
-        loadStatus();
-        if ('library_dir' in patch) {
-          reloadTracks();
-          loadPlaylists();
-        }
+        if ('spotify_client_id' in patch && spotify.connected) toast('New Client ID saved: click Connect Spotify to connect through it', 'info');
         return;
       } catch (err) {
         showError(err); // and open the same dialog again with what was typed
       }
     }
+  }
+
+  /** Spotify's consent page sends the browser back to /?spotify=connected or /?spotify=error:
+   *  say so once, then tidy the address bar. The error text comes from the server (GET
+   *  /api/spotify hands it out once), never from the address: a link from another site must
+   *  not be able to make the app show a message of its choosing. */
+  function handleSpotifyReturn() {
+    const params = new URLSearchParams(window.location.search);
+    if (!params.has('spotify') && !params.has('spotify_error')) return; // the latter: old links, ignored
+    const outcome = params.get('spotify');
+    if (outcome === 'connected') {
+      api('/api/spotify')
+        .then((s) => toast(s && s.display_name ? `Spotify connected as ${s.display_name}` : 'Spotify connected', 'success', 6000))
+        .catch(() => toast('Spotify connected', 'success', 6000));
+    } else if (outcome === 'error') {
+      api('/api/spotify')
+        .then((s) => {
+          if (s && s.last_error) toast(String(s.last_error), 'error', 12000);
+        })
+        .catch(() => {});
+    }
+    history.replaceState(null, '', `${window.location.pathname}${window.location.hash}`);
   }
 
   // ================================================================ Queue
@@ -2010,6 +2169,7 @@
     initKeyboard();
 
     if (window.location.hash === '#playlists') switchTab('playlists');
+    handleSpotifyReturn();
 
     loadStatus();
     pollJobs();

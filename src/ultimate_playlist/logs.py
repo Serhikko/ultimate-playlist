@@ -37,14 +37,35 @@ def _access_status(record: logging.LogRecord) -> int | None:
     return None
 
 
+# Paths whose query string carries a secret: Spotify's one-time login code. Their access lines
+# are written without it. (The same value as providers/spotify_auth.CALLBACK_PATH, which a test
+# checks; importing it here would pull the HTTP stack into the logging setup.)
+SECRET_QUERY_PATHS: tuple[str, ...] = ("/api/spotify/callback",)
+HIDDEN_QUERY = "?[hidden]"
+
+
+def _scrub_access_path(record: logging.LogRecord) -> None:
+    """Replace the query string of a secret-carrying path in a uvicorn access record."""
+    args = record.args
+    if not (isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str)):
+        return
+    path, _, query = args[2].partition("?")
+    if query and path.startswith(SECRET_QUERY_PATHS):
+        record.args = (*args[:2], path + HIDDEN_QUERY, *args[3:])
+
+
 class RoutineAccessFilter(logging.Filter):
-    """Drop access lines for successful requests: the UI polls /api/jobs every second."""
+    """Drop access lines for successful requests (the UI polls /api/jobs every second) and keep
+    the Spotify login code out of the ones that are written (a callback that failed)."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         if record.name != "uvicorn.access":
             return True
         status = _access_status(record)
-        return status is None or status >= 400
+        if status is not None and status < 400:
+            return False
+        _scrub_access_path(record)
+        return True
 
 
 UVICORN_LOGGERS = ("uvicorn", "uvicorn.error")  # TidyNameFilter may have renamed it already

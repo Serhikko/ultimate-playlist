@@ -7,26 +7,32 @@ the real pieces under test are the ref building, the file naming, the tags and t
 from __future__ import annotations
 
 import json
+import re
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from fake_provider import TINY_MP3, FakeRegistry, write_tiny_mp3
+import requests
+from fake_provider import TINY_M4A, TINY_MP3, TINY_OPUS, FakeRegistry, write_tiny_mp3
 from mutagen.id3 import APIC, ID3
 from mutagen.mp3 import MP3
+from mutagen.mp4 import MP4, MP4FreeForm
+from mutagen.oggopus import OggOpus
 
 from ultimate_playlist import providers
-from ultimate_playlist.config import Settings
+from ultimate_playlist.config import Settings, app_data_dir
 from ultimate_playlist.downloader import JobManager
 from ultimate_playlist.library import Library
 from ultimate_playlist.models import JobStatus, ProgressEvent, Track, TrackRef
 from ultimate_playlist.providers import spotify
+from ultimate_playlist.providers import spotify_auth as sa
 from ultimate_playlist.providers import spotify_meta as sm
 from ultimate_playlist.providers.base import DownloadCancelled, Provider, ProviderError
 from ultimate_playlist.providers.spotify import SpotifyProvider
-from ultimate_playlist.providers.youtube import stored_track_id
+from ultimate_playlist.providers.youtube import YouTubeProvider, stored_track_id
 from ultimate_playlist.providers.ytmusic_match import Match
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "spotify"
@@ -369,6 +375,27 @@ def test_resolve_uses_configured_settings(metadata: dict[str, Any], tmp_path: Pa
     assert metadata["calls"][0][2] is settings
 
 
+def test_resolve_liked_songs(metadata: dict[str, Any], tmp_path: Path) -> None:
+    songs = load_entity("album").tracks[:2]
+    metadata["entity"] = sm.SpotifyEntity(
+        kind=sm.LIKED_KIND, id=sm.LIKED_ID, name=sm.LIKED_NAME, source="api", tracks=songs
+    )
+    provider = SpotifyProvider(Settings(library_dir=tmp_path / "lib"))
+    refs = provider.resolve("https://open.spotify.com/collection/tracks")
+    assert metadata["calls"][0][:2] == ("liked", "tracks")
+    assert [r.source_id for r in refs] == [s.id for s in songs]
+    assert [r.extra["container"] for r in refs] == ["Playlist: Liked Songs"] * 2
+
+
+def test_resolve_liked_songs_without_a_connection(tmp_path: Path) -> None:
+    settings = Settings(library_dir=tmp_path / "lib")
+    for client_id in ("", "my-client-id"):
+        settings.spotify_client_id = client_id
+        with pytest.raises(ProviderError) as exc_info:
+            SpotifyProvider(settings).resolve("https://open.spotify.com/intl-de/collection/tracks")
+        assert str(exc_info.value) == "Connect Spotify in Settings to download your Liked Songs"
+
+
 # ----------------------------------------------------------------------------------------------
 # download()
 # ----------------------------------------------------------------------------------------------
@@ -418,13 +445,16 @@ def test_download_success(
     assert apic.data == SPOTIFY_COVER and apic.mime == "image/jpeg"
     assert stored_track_id(final) == f"spotify:{TRACK_ID}"
 
-    # the YouTube step ran inside .incoming and nothing is left behind there
+    # the YouTube step ran in a folder of its own under .incoming, which is gone afterwards
     (yt_ref, yt_dest) = fake_youtube.calls[0]
-    assert yt_dest == tmp_settings.library_dir / ".incoming"
+    incoming = tmp_settings.library_dir / ".incoming"
+    assert yt_dest.parent == incoming
+    assert re.fullmatch(rf"sp-{TRACK_ID}-[0-9a-f]{{8}}", yt_dest.name)
     assert yt_ref.provider == "youtube" and yt_ref.source_id == VIDEO_ID
     assert yt_ref.url == f"https://www.youtube.com/watch?v={VIDEO_ID}"
     assert yt_ref.title == ref.title and yt_ref.artist == ref.artist
-    assert [p.name for p in yt_dest.iterdir()] == []
+    assert not yt_dest.exists()
+    assert list(incoming.iterdir()) == []
     assert ref.extra["youtube_id"] == VIDEO_ID
     assert matched["calls"] == [ref]
 
@@ -716,33 +746,290 @@ def test_write_spotify_tags_on_other_containers(tmp_path: Path) -> None:
         assert cover is not None and cover[0] == SPOTIFY_COVER
 
 
+@pytest.mark.parametrize("fmt", ["m4a", "opus"])
+def test_write_spotify_tags_drops_youtube_values_spotify_does_not_have(
+    tmp_path: Path, fmt: str
+) -> None:
+    """yt-dlp writes its own date (the upload date), track number and the like; where Spotify
+    has no value for a field the YouTube one must not survive, like on the ID3 path."""
+    path = tmp_path / f"song.{fmt}"
+    path.write_bytes(TINY_M4A if fmt == "m4a" else TINY_OPUS)
+    if fmt == "m4a":
+        mp4 = MP4(path)
+        mp4["aART"] = ["Some Channel"]
+        mp4["trkn"] = [(7, 0)]
+        mp4["\xa9day"] = ["20240101"]
+        mp4[spotify.MP4_ISRC_KEY] = [MP4FreeForm(b"XX0000000000")]
+        mp4.save()
+    else:
+        opus = OggOpus(path)
+        opus["albumartist"] = ["Some Channel"]
+        opus["album_artist"] = ["Some Channel"]
+        opus["tracknumber"] = ["7"]
+        opus["date"] = ["20240101"]
+        opus["isrc"] = ["XX0000000000"]
+        opus.save()
+
+    bare = a_ref(album=None, thumbnail_url=None, extra={"source": "embed"})
+    spotify.write_spotify_tags(path, bare, VIDEO_ID, None)
+
+    if fmt == "m4a":
+        tags: Any = MP4(path).tags
+        for key in ("aART", "trkn", "\xa9day", spotify.MP4_ISRC_KEY):
+            assert key not in tags, key
+        assert bytes(tags[spotify.MP4_YOUTUBE_ID_KEY][0]) == VIDEO_ID.encode()
+    else:
+        tags = OggOpus(path).tags
+        for key in ("albumartist", "album_artist", "tracknumber", "date", "isrc"):
+            assert key not in tags, key
+        assert tags[spotify.TXXX_YOUTUBE_ID] == [VIDEO_ID]
+
+    # ...and Spotify's own values are written when it has them
+    spotify.write_spotify_tags(path, a_ref(), VIDEO_ID, None)
+    if fmt == "m4a":
+        tags = MP4(path).tags
+        assert tags["aART"] == ["Daft Punk"] and tags["trkn"] == [(1, 0)]
+        assert tags["\xa9day"] == ["2013"]
+        assert bytes(tags[spotify.MP4_ISRC_KEY][0]) == b"USQX91300102"
+    else:
+        tags = OggOpus(path).tags
+        assert tags["albumartist"] == ["Daft Punk"] and "album_artist" not in tags
+        assert tags["tracknumber"] == ["1"] and tags["date"] == ["2013"]
+        assert tags["isrc"] == ["USQX91300102"]
+
+
+OTHER_TRACK_ID = "1dEIca2nhcxDUV8C5QkPYb"
+
+
+def test_two_tracks_matching_one_video_stage_separately(
+    tmp_settings: Settings,
+    cover_requests: dict[str, Any],
+    matched: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single and its album version (or a song that is twice in a playlist) can match the
+    same YouTube video. Both downloads must end with a file of their own: each stages in its
+    own folder, and the per-video lock still keeps the video from being fetched twice at once."""
+    fake = FakeYouTube()
+    guard = threading.Lock()
+    active: dict[str, int] = {}
+    peak: dict[str, int] = {}
+    youtube_steps_done: list[str] = []
+    both_downloaded = threading.Event()
+    plain_download = fake.download
+
+    def download(
+        ref: TrackRef, dest_dir: Path, settings: Settings, progress: Any, cancel: threading.Event
+    ) -> Track:
+        with guard:
+            active[ref.source_id] = active.get(ref.source_id, 0) + 1
+            peak[ref.source_id] = max(peak.get(ref.source_id, 0), active[ref.source_id])
+        try:
+            time.sleep(0.05)  # long enough for the other worker to pile in
+            return plain_download(ref, dest_dir, settings, progress, cancel)
+        finally:
+            with guard:
+                active[ref.source_id] -= 1
+                youtube_steps_done.append(ref.source_id)
+                if len(youtube_steps_done) == 2:
+                    both_downloaded.set()
+
+    fake.download = download  # type: ignore[method-assign]
+    monkeypatch.setattr(SpotifyProvider, "_youtube_provider", staticmethod(lambda settings: fake))
+
+    # The first worker to reach the tagging step waits there until the other worker's YouTube
+    # step has finished: with one shared staging file, its file would have been replaced by now.
+    first_tagger = threading.Lock()
+    real_write_tags = spotify.write_spotify_tags
+
+    def write_tags_slowly(path: Path, ref: TrackRef, video_id: str, cover: Any) -> bool:
+        if first_tagger.acquire(blocking=False):
+            both_downloaded.wait(WAIT)
+        return real_write_tags(path, ref, video_id, cover)
+
+    monkeypatch.setattr(spotify, "write_spotify_tags", write_tags_slowly)
+
+    refs = [
+        a_ref(),
+        a_ref(source_id=OTHER_TRACK_ID, url=f"https://open.spotify.com/track/{OTHER_TRACK_ID}"),
+    ]
+    results: dict[str, Track] = {}
+    errors: dict[str, Exception] = {}
+
+    def run(ref: TrackRef) -> None:
+        try:
+            results[ref.source_id] = SpotifyProvider(tmp_settings).download(
+                ref, tmp_settings.library_dir, tmp_settings, lambda e: None, threading.Event()
+            )
+        except Exception as exc:  # noqa: BLE001 - reported by the assertion below
+            errors[ref.source_id] = exc
+
+    threads = [threading.Thread(target=run, args=(ref,)) for ref in refs]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(WAIT)
+
+    assert errors == {}
+    assert peak == {VIDEO_ID: 1}  # never two downloads of one video at the same time
+    incoming = tmp_settings.library_dir / ".incoming"
+    staged = [dest for _, dest in fake.calls]
+    assert len(set(staged)) == 2 and all(dest.parent == incoming for dest in staged)
+    assert sorted(track.path for track in results.values()) == [
+        "Daft Punk - Give Life Back to Music (2).mp3",
+        "Daft Punk - Give Life Back to Music.mp3",
+    ]
+    for source_id, track in results.items():
+        assert stored_track_id(tmp_settings.library_dir / track.path) == f"spotify:{source_id}"
+    assert list(incoming.iterdir()) == []
+
+
+def test_youtube_provider_is_the_registered_one(tmp_path: Path) -> None:
+    registered = providers.provider_by_name("youtube")
+    assert registered is not None
+    assert SpotifyProvider._youtube_provider(Settings(library_dir=tmp_path / "lib")) is registered
+
+
+def test_youtube_provider_fallback_when_youtube_is_not_registered(tmp_path: Path) -> None:
+    settings = Settings(library_dir=tmp_path / "lib")
+    saved = list(providers.PROVIDERS)
+    providers.unregister("youtube")
+    try:
+        assert providers.provider_by_name("youtube") is None
+        provider = SpotifyProvider._youtube_provider(settings)
+    finally:
+        providers.PROVIDERS[:] = saved
+    assert isinstance(provider, YouTubeProvider)
+    assert provider is not providers.provider_by_name("youtube")
+    assert provider._settings is settings  # built with the download's own settings
+
+
 # ----------------------------------------------------------------------------------------------
 # doctor()
 # ----------------------------------------------------------------------------------------------
 
+CLIENT_ID = "my-client-id"
 
-def test_doctor_without_credentials(tmp_path: Path) -> None:
+
+def connect(client_id: str = CLIENT_ID, expires_in: float = 3600) -> None:
+    """Pretend the user clicked Connect Spotify: a token file bound to `client_id`."""
+    record = {
+        "refresh_token": "refresh1",
+        "access_token": "tok1",
+        "expires_at": time.time() + expires_in,
+        "scope": sa.SCOPES,
+        "user_id": "listener42",
+        "display_name": "Test Listener",
+        "client_id": client_id,
+    }
+    (app_data_dir() / sa.TOKEN_FILE_NAME).write_text(json.dumps(record), encoding="utf-8")
+
+
+def token_answer(status: int, body: dict[str, Any]) -> SimpleNamespace:
+    return SimpleNamespace(status_code=status, json=lambda: body)
+
+
+class TokenEndpoint:
+    """spotify_auth's HTTP session in the doctor tests: it only answers the token endpoint."""
+
+    def __init__(self, answer: Any) -> None:
+        self.answer = answer
+        self.posts: list[dict[str, Any]] = []
+
+    def post(
+        self,
+        url: str,
+        data: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> Any:
+        self.posts.append(dict(data or {}))
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        return self.answer
+
+    def get(self, *args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("doctor() must not call the Web API")
+
+
+@pytest.fixture
+def token_endpoint(monkeypatch: pytest.MonkeyPatch) -> TokenEndpoint:
+    endpoint = TokenEndpoint(token_answer(200, {"access_token": "tok2", "expires_in": 3600}))
+    monkeypatch.setattr(sa, "_session", endpoint)
+    return endpoint
+
+
+def client_settings(tmp_path: Path, client_id: str = CLIENT_ID) -> Settings:
+    settings = Settings(library_dir=tmp_path / "lib")
+    settings.spotify_client_id = client_id
+    return settings
+
+
+def test_doctor_public_pages_only(tmp_path: Path) -> None:
     settings = Settings(library_dir=tmp_path / "lib")
     (ok, label, detail) = SpotifyProvider(settings).doctor()[0]
-    assert ok is True and label == "Spotify"
-    assert detail.startswith("No API credentials: using Spotify's public pages")
-    assert f"about {sm.EMBED_LIST_CAP} tracks" in detail
-    assert "client id and secret in Settings" in detail
+    assert (ok, label) == (True, "Spotify")
+    assert detail == (
+        "Public pages only (tracks, albums, playlists up to 100 songs). Connect Spotify in "
+        "Settings for your own bigger playlists and Liked Songs."
+    )
     assert SpotifyProvider().doctor(settings) == [(ok, label, detail)]
 
 
-def test_doctor_with_credentials(tmp_path: Path) -> None:
-    settings = Settings(library_dir=tmp_path / "lib")
-    settings.spotify_client_id = "id"
-    settings.spotify_client_secret = "secret"
-    assert SpotifyProvider(settings).doctor() == [
-        (True, "Spotify", "Web API credentials set (playlists of any size)")
+def test_doctor_client_id_set_but_not_connected(
+    tmp_path: Path, token_endpoint: TokenEndpoint
+) -> None:
+    expected = [
+        (True, "Spotify", "Client ID set, not connected: click Connect Spotify in Settings")
     ]
-    assert (
-        SpotifyProvider().doctor(settings)[0][2]
-        == "Web API credentials set (playlists of any size)"
-    )
-    assert providers.run_doctor(SpotifyProvider(), settings)[0][0] is True
+    assert SpotifyProvider(client_settings(tmp_path)).doctor() == expected
+    connect(client_id="another-developer-app")  # connected, but through a different app
+    assert SpotifyProvider(client_settings(tmp_path)).doctor() == expected
+    assert token_endpoint.posts == []
+
+
+def test_doctor_connected(tmp_path: Path, token_endpoint: TokenEndpoint) -> None:
+    connect()
+    settings = client_settings(tmp_path)
+    expected = [
+        (
+            True,
+            "Spotify",
+            "Connected as Test Listener (your playlists of any size and Liked Songs)",
+        )
+    ]
+    assert SpotifyProvider(settings).doctor() == expected
+    assert providers.run_doctor(SpotifyProvider(), settings) == expected
+    assert token_endpoint.posts == []  # a fresh token: no network at all
+
+
+def test_doctor_renews_an_expired_token(tmp_path: Path, token_endpoint: TokenEndpoint) -> None:
+    connect(expires_in=-10)
+    (ok, _, detail) = SpotifyProvider(client_settings(tmp_path)).doctor()[0]
+    assert ok is True and detail.startswith("Connected as Test Listener")
+    assert [post["grant_type"] for post in token_endpoint.posts] == ["refresh_token"]
+
+
+def test_doctor_reports_a_rejected_connection(
+    tmp_path: Path, token_endpoint: TokenEndpoint
+) -> None:
+    connect(expires_in=-10)
+    token_endpoint.answer = token_answer(400, {"error": "invalid_grant"})
+    provider = SpotifyProvider(client_settings(tmp_path))
+    assert provider.doctor() == [
+        (False, "Spotify", "Spotify connection expired, connect again in Settings")
+    ]
+    # the rejected connection is gone: from now on it is simply "not connected"
+    assert provider.doctor() == [(True, "Spotify", spotify.DOCTOR_NOT_CONNECTED)]
+
+
+def test_doctor_offline_with_an_expired_token_still_says_connected(
+    tmp_path: Path, token_endpoint: TokenEndpoint
+) -> None:
+    connect(expires_in=-10)
+    token_endpoint.answer = requests.ConnectionError("offline")
+    (ok, _, detail) = SpotifyProvider(client_settings(tmp_path)).doctor()[0]
+    assert ok is True and detail.startswith("Connected as Test Listener")
 
 
 def test_doctor_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
