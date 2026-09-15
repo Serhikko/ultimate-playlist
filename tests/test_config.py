@@ -57,6 +57,9 @@ def test_defaults() -> None:
     assert s.concurrency == 2
     assert s.embed_cover is True
     assert s.js_runtimes == ["deno", "node"]
+    assert s.spotify_client_id == ""
+    assert s.spotify_client_secret == ""
+    assert s.has_spotify_credentials is False
 
 
 def test_derived_paths(home: Path, tmp_path: Path) -> None:
@@ -179,6 +182,8 @@ def test_to_dict_is_json_safe(tmp_path: Path) -> None:
         "concurrency",
         "embed_cover",
         "js_runtimes",
+        "spotify_client_id",
+        "spotify_client_secret",
     }
     assert Settings.from_dict(data) == s
 
@@ -189,3 +194,84 @@ def test_save_is_atomic_and_overwrites(tmp_path: Path) -> None:
     Settings(library_dir=tmp_path / "b").save(path)
     assert Settings.load(path).library_dir == tmp_path / "b"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["config.json"]
+
+
+# -- Spotify credentials -----------------------------------------------------------------------
+
+
+def test_spotify_credentials_round_trip(tmp_path: Path) -> None:
+    original = Settings(
+        library_dir=tmp_path / "lib", spotify_client_id="abc123", spotify_client_secret="s3cr3t"
+    )
+    assert original.has_spotify_credentials is True
+    path = tmp_path / "config.json"
+    original.save(path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    # config.json is the user's private file: the secret is stored as-is, not masked
+    assert data["spotify_client_id"] == "abc123"
+    assert data["spotify_client_secret"] == "s3cr3t"
+    loaded = Settings.load(path)
+    assert loaded == original
+    assert loaded.spotify_client_secret == "s3cr3t"
+
+
+def test_spotify_credentials_are_stripped_and_tolerant(tmp_path: Path) -> None:
+    s = Settings(spotify_client_id="  abc123 \n", spotify_client_secret="\ts3cr3t ")
+    assert (s.spotify_client_id, s.spotify_client_secret) == ("abc123", "s3cr3t")
+    # a v0.1 config.json has no such keys; a hand-edited one may hold null or a number
+    assert Settings.from_dict({}).spotify_client_id == ""
+    assert Settings.from_dict({"spotify_client_secret": None}).spotify_client_secret == ""
+    assert Settings.from_dict({"spotify_client_id": 12345}).spotify_client_id == ""
+    assert Settings.from_dict({"spotify_client_id": " x "}).spotify_client_id == "x"
+    assert Settings(spotify_client_id="only-id").has_spotify_credentials is False
+    assert Settings(spotify_client_secret="only-secret").has_spotify_credentials is False
+
+
+def test_public_dict_masks_the_secret(tmp_path: Path) -> None:
+    unset = Settings(library_dir=tmp_path / "lib")
+    assert unset.public_dict() == unset.to_dict()
+    assert unset.public_dict()["spotify_client_secret"] == ""
+    s = Settings(library_dir=tmp_path / "lib", spotify_client_id="id", spotify_client_secret="s3")
+    public = s.public_dict()
+    assert public["spotify_client_secret"] == config.SECRET_MASK == "********"
+    assert public["spotify_client_id"] == "id"  # the id is not sensitive
+    expected = s.to_dict()
+    expected["spotify_client_secret"] = "********"
+    assert public == expected  # everything else is untouched
+    assert "s3" not in json.dumps(public)
+    assert s.spotify_client_secret == "s3"  # public_dict() does not touch the object
+
+
+def test_clean_credential() -> None:
+    assert config.clean_credential("  abc-123_XYZ.~ ", "Spotify client ID") == "abc-123_XYZ.~"
+    assert config.clean_credential("", "Spotify client ID") == ""
+    assert config.clean_credential("x" * 200, "Spotify client secret") == "x" * 200
+    with pytest.raises(ValueError, match="too long"):
+        config.clean_credential("x" * 201, "Spotify client secret")
+    with pytest.raises(ValueError, match="plain ASCII"):
+        config.clean_credential("ünïcode", "Spotify client ID")
+    with pytest.raises(ValueError, match="plain ASCII"):
+        config.clean_credential("tab\there", "Spotify client ID")
+    with pytest.raises(ValueError, match="Spotify client secret"):
+        config.clean_credential("\x00", "Spotify client secret")
+
+
+def test_shared_value_rules() -> None:
+    """The rules `PUT /api/settings` and `up config set` share."""
+    assert config.clean_audio_format(" MP3 ") == "mp3"
+    with pytest.raises(ValueError, match="mp3, m4a, opus, flac"):
+        config.clean_audio_format("wma")
+    assert config.clean_audio_quality(" 192K ") == "192"
+    assert config.clean_audio_quality("0") == "0"
+    for bad in ("", "banana", "-1", "1.5", "1234", "k"):
+        with pytest.raises(ValueError, match="Audio quality"):
+            config.clean_audio_quality(bad)
+    assert config.clean_concurrency(6) == 6
+    for bad in (0, 7, -1):
+        with pytest.raises(ValueError, match="between 1 and 6"):
+            config.clean_concurrency(bad)
+    assert config.clean_js_runtimes(["Node", "node", " deno "]) == ["node", "deno"]
+    with pytest.raises(ValueError, match="at least one"):
+        config.clean_js_runtimes(["", "  "])
+    with pytest.raises(ValueError, match="'foo'.*deno"):
+        config.clean_js_runtimes(["foo"])

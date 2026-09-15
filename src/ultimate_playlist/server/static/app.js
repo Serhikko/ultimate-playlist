@@ -250,7 +250,13 @@
         ),
       );
       dialogEl.append(form);
-      dialogEl.onclose = () => done(false);
+      // The close event is fired a frame after close(), so when a dialog is re-opened right
+      // away (Settings after a rejected save) the previous dialog's close event lands on this
+      // one. A genuine close (Escape, Cancel) has already cleared `open` by then; a stale one
+      // finds the new dialog open and must be ignored.
+      dialogEl.onclose = () => {
+        if (!dialogEl.open) done(false);
+      };
       dialogEl.onclick = (event) => {
         if (event.target === dialogEl) done(false);
       };
@@ -438,7 +444,30 @@
         mark: js && js.ok ? '✓' : '✗',
         label: 'JS runtime',
         short: 'JS',
-        tip: js ? js.detail || js.label : 'No JavaScript runtime check reported. YouTube downloads need Node.js or Deno.',
+        tip: js ? js.detail || js.label : 'No JavaScript runtime check reported. Downloads need Node.js or Deno.',
+      }),
+    );
+
+    // Spotify: driven by whatever the Spotify provider's doctor() reports. Its own check
+    // ("Spotify ...") decides the colour; other failing checks it lists (the YouTube pipeline it
+    // downloads through) turn a green chip amber and are added to the tooltip.
+    const spotify = (status.providers || []).find((p) => p.name === 'spotify') || null;
+    const spotifyChecks = spotify ? spotify.checks || [] : [];
+    const primary = spotifyChecks.find((c) => /spotify/i.test(c.label || '')) || spotifyChecks[0] || null;
+    const others = spotifyChecks.filter((c) => c !== primary && !c.ok);
+    const spotifyKind = !primary || !primary.ok ? 'bad' : others.length ? 'warn' : 'ok';
+    const tipLines = [primary ? primary.detail || primary.label : 'The Spotify provider is not available in this build.'];
+    for (const c of others) tipLines.push(`${c.label}: ${c.detail || 'check failed'}`);
+    tipLines.push('Click to open Settings');
+    chips.append(
+      chip({
+        id: 'spotify-chip',
+        kind: spotifyKind,
+        mark: spotifyKind === 'ok' ? '✓' : spotifyKind === 'warn' ? '!' : '✗',
+        label: 'Spotify',
+        short: 'Sp',
+        tip: tipLines.join('\n'),
+        onclick: openSettingsDialog,
       }),
     );
 
@@ -501,6 +530,112 @@
       await api('/api/library/open', { method: 'POST' });
     } catch (err) {
       showError(err);
+    }
+  }
+
+  // ================================================================ Settings
+
+  // What GET /api/settings returns in place of a stored Spotify secret; sending it back means
+  // "keep the one you have", so the form can be saved without ever seeing the real value.
+  const SECRET_MASK = '********';
+
+  function settingsField(labelText, input, note) {
+    return el(
+      'label',
+      { class: 'field' },
+      el('span', { class: 'field-label', text: labelText }),
+      input,
+      note ? el('span', { class: 'field-note muted', text: note }) : null,
+    );
+  }
+
+  /** Enter in a text field submits the dialog form explicitly (see promptDialog). */
+  function submitOnEnter(input) {
+    input.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' || event.isComposing) return;
+      event.preventDefault();
+      const form = input.closest('form');
+      if (form) form.requestSubmit();
+    });
+    return input;
+  }
+
+  let settingsOpen = false;
+
+  async function openSettingsDialog() {
+    if (settingsOpen || dialogEl.open) return;
+    settingsOpen = true;
+    try {
+      await settingsDialog();
+    } finally {
+      settingsOpen = false;
+    }
+  }
+
+  async function settingsDialog() {
+    let current;
+    try {
+      current = await api('/api/settings');
+    } catch (err) {
+      showError(err);
+      return;
+    }
+    const libraryInput = submitOnEnter(
+      el('input', { type: 'text', class: 'input', value: current.library_dir || '', required: true, spellcheck: false, autocomplete: 'off' }),
+    );
+    const concurrencyInput = submitOnEnter(
+      el('input', { type: 'number', class: 'input input-num', value: String(current.concurrency || 2), min: 1, max: 6, step: 1, required: true }),
+    );
+    const idInput = submitOnEnter(
+      el('input', { type: 'text', class: 'input', value: current.spotify_client_id || '', maxLength: 200, spellcheck: false, autocomplete: 'off', placeholder: 'optional' }),
+    );
+    const secretInput = submitOnEnter(
+      el('input', { type: 'password', class: 'input', value: current.spotify_client_secret || '', maxLength: 200, autocomplete: 'new-password', placeholder: 'optional' }),
+    );
+    const body = [
+      settingsField('Library folder', libraryInput, 'The app creates it if needed; changing it re-scans the new folder.'),
+      settingsField('Parallel downloads (1–6)', concurrencyInput),
+      settingsField('Spotify client ID', idInput),
+      settingsField('Spotify client secret', secretInput),
+      el(
+        'p',
+        { class: 'help' },
+        'Not required. Without it Spotify links work through Spotify’s public pages (tracks, albums, playlists up to about 100 songs). For bigger playlists create a free app at ',
+        el('a', { href: 'https://developer.spotify.com/dashboard', target: '_blank', rel: 'noopener noreferrer', text: 'https://developer.spotify.com/dashboard' }),
+        ' (any name, redirect URI http://127.0.0.1:8765/), then paste its Client ID and Client secret here.',
+      ),
+    ];
+    // The inputs are the same DOM nodes on every round, so a rejected value stays on screen
+    // for the user to fix instead of being wiped by the retry.
+    for (;;) {
+      const ok = await openDialog({ title: 'Settings', body, confirmLabel: 'Save', focus: libraryInput });
+      if (!ok) return;
+      const patch = {};
+      const libraryDir = libraryInput.value.trim();
+      if (libraryDir !== String(current.library_dir || '')) patch.library_dir = libraryDir;
+      const concurrency = Number(concurrencyInput.value);
+      if (concurrency !== Number(current.concurrency)) patch.concurrency = concurrency;
+      const clientId = idInput.value.trim();
+      if (clientId !== String(current.spotify_client_id || '')) patch.spotify_client_id = clientId;
+      const secret = secretInput.value.trim();
+      // Untouched, the field still holds the mask: the server would treat that as "unchanged" too.
+      if (secret !== SECRET_MASK && secret !== String(current.spotify_client_secret || '')) patch.spotify_client_secret = secret;
+      if (!Object.keys(patch).length) {
+        toast('Nothing changed', 'info');
+        return;
+      }
+      try {
+        current = await api('/api/settings', { method: 'PUT', body: patch });
+        toast('Settings saved', 'success');
+        loadStatus();
+        if ('library_dir' in patch) {
+          reloadTracks();
+          loadPlaylists();
+        }
+        return;
+      } catch (err) {
+        showError(err); // and open the same dialog again with what was typed
+      }
     }
   }
 
@@ -1869,6 +2004,7 @@
     $('#clear-selection').addEventListener('click', clearSelection);
     $('#rescan').addEventListener('click', rescanLibrary);
     $('#new-playlist').addEventListener('click', () => createPlaylist([]));
+    $('#settings-btn').addEventListener('click', openSettingsDialog);
 
     initPlayer();
     initKeyboard();

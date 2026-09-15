@@ -33,7 +33,15 @@ from starlette.datastructures import Headers
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .. import __version__, providers
-from ..config import Settings
+from ..config import (
+    SECRET_MASK,
+    Settings,
+    clean_audio_format,
+    clean_audio_quality,
+    clean_concurrency,
+    clean_credential,
+    clean_js_runtimes,
+)
 from ..downloader import JobManager
 from ..ffmpeg import find_ffmpeg
 from ..library import Library, LibraryFileInUse, LibraryUnavailable
@@ -45,9 +53,6 @@ from ..providers import run_doctor
 log = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-AUDIO_FORMATS = ("mp3", "m4a", "opus", "flac")
-JS_RUNTIMES = ("deno", "node", "bun", "quickjs")  # what yt-dlp knows; anything else is ignored
-MIN_CONCURRENCY, MAX_CONCURRENCY = 1, 6
 PORT_ATTEMPTS = 11  # the requested port plus the next 10
 M3U8_MEDIA_TYPE = "audio/x-mpegurl"
 # The only Host / Origin values a local app should ever see. Anything else is a DNS-rebinding
@@ -76,8 +81,6 @@ _WINDOWS_RESERVED = frozenset(
     | {f"COM{i}" for i in range(1, 10)}
     | {f"LPT{i}" for i in range(1, 10)}
 )
-# yt-dlp's preferredquality: 0-10 is a VBR level (0 = best), anything above is a bitrate in kbps.
-_AUDIO_QUALITY_RE = re.compile(r"^\d{1,3}$")
 # Browsers must not second-guess the declared type of a cover or an audio file.
 NOSNIFF = {"X-Content-Type-Options": "nosniff"}
 
@@ -90,7 +93,11 @@ class JobRequest(BaseModel):
 
 
 class SettingsPatch(BaseModel):
-    """Partial settings update; every field is optional and unknown keys are ignored."""
+    """Partial settings update; every field is optional and unknown keys are ignored.
+
+    `spotify_client_secret` equal to SECRET_MASK (what GET hands out) means "leave the stored
+    secret alone", so a settings form can be submitted as a whole without knowing the secret.
+    """
 
     model_config = ConfigDict(extra="ignore")
 
@@ -101,6 +108,8 @@ class SettingsPatch(BaseModel):
     concurrency: int | None = None
     embed_cover: bool | None = None
     js_runtimes: list[str] | None = None
+    spotify_client_id: str | None = None
+    spotify_client_secret: str | None = None
 
 
 class PlaylistCreate(BaseModel):
@@ -215,7 +224,17 @@ class LoopbackOnlyMiddleware:
 
 
 def provider_status(settings: Settings | None = None) -> list[dict[str, Any]]:
-    """Doctor checks of every registered provider, in registry order. Never raises."""
+    """Doctor checks of every registered provider, in registry order. Never raises.
+
+    Check texts are free-form provider output; the Spotify secret is scrubbed out of them as a
+    safety net, so no provider can ever echo it into the status page.
+    """
+    secret = settings.spotify_client_secret if settings is not None else ""
+
+    def scrub(text: object) -> str:
+        value = str(text)
+        return value.replace(secret, SECRET_MASK) if secret else value
+
     result: list[dict[str, Any]] = []
     for provider in list(providers.PROVIDERS):
         try:
@@ -229,7 +248,7 @@ def provider_status(settings: Settings | None = None) -> list[dict[str, Any]]:
                 "name": provider.name,
                 "display_name": getattr(provider, "display_name", provider.name),
                 "checks": [
-                    {"ok": bool(ok), "label": label, "detail": detail}
+                    {"ok": bool(ok), "label": scrub(label), "detail": scrub(detail)}
                     for ok, label, detail in checks
                 ],
             }
@@ -261,21 +280,9 @@ def _validate_settings_patch(patch: SettingsPatch) -> dict[str, Any]:
             raise HTTPException(400, f"{new_dir} is not a folder.")
         changes["library_dir"] = new_dir
     if patch.audio_format is not None:
-        fmt = patch.audio_format.strip().lower()
-        if fmt not in AUDIO_FORMATS:
-            raise HTTPException(400, f"Audio format must be one of: {', '.join(AUDIO_FORMATS)}.")
-        changes["audio_format"] = fmt
+        changes["audio_format"] = _clean(clean_audio_format, patch.audio_format)
     if patch.audio_quality is not None:
-        quality = patch.audio_quality.strip().rstrip("kK").strip()
-        if not quality:
-            raise HTTPException(400, "Audio quality cannot be empty (use 0 for best).")
-        if not _AUDIO_QUALITY_RE.match(quality):
-            raise HTTPException(
-                400,
-                "Audio quality must be 0-10 (0 = best variable bitrate) or a bitrate in kbps "
-                "such as 192.",
-            )
-        changes["audio_quality"] = quality
+        changes["audio_quality"] = _clean(clean_audio_quality, patch.audio_quality)
     if patch.ffmpeg_path is not None:
         raw = patch.ffmpeg_path.strip()
         if raw:
@@ -290,25 +297,28 @@ def _validate_settings_patch(patch: SettingsPatch) -> dict[str, Any]:
         else:
             changes["ffmpeg_path"] = None
     if patch.concurrency is not None:
-        if not MIN_CONCURRENCY <= patch.concurrency <= MAX_CONCURRENCY:
-            raise HTTPException(
-                400, f"Concurrency must be between {MIN_CONCURRENCY} and {MAX_CONCURRENCY}."
-            )
-        changes["concurrency"] = patch.concurrency
+        changes["concurrency"] = _clean(clean_concurrency, patch.concurrency)
     if patch.embed_cover is not None:
         changes["embed_cover"] = patch.embed_cover
     if patch.js_runtimes is not None:
-        runtimes = [rt.strip().lower() for rt in patch.js_runtimes if rt and rt.strip()]
-        if not runtimes:
-            raise HTTPException(400, "List at least one JavaScript runtime (deno, node).")
-        for runtime in runtimes:
-            if runtime not in JS_RUNTIMES:
-                raise HTTPException(
-                    400,
-                    f"Unknown JavaScript runtime {runtime!r}; use one of: {', '.join(JS_RUNTIMES)}.",
-                )
-        changes["js_runtimes"] = list(dict.fromkeys(runtimes))
+        changes["js_runtimes"] = _clean(clean_js_runtimes, patch.js_runtimes)
+    if patch.spotify_client_id is not None:
+        changes["spotify_client_id"] = _clean(
+            clean_credential, patch.spotify_client_id, "Spotify client ID"
+        )
+    if patch.spotify_client_secret is not None and patch.spotify_client_secret != SECRET_MASK:
+        changes["spotify_client_secret"] = _clean(
+            clean_credential, patch.spotify_client_secret, "Spotify client secret"
+        )
     return changes
+
+
+def _clean(rule: Any, *args: Any) -> Any:
+    """Apply one of config.py's value rules; its ValueError becomes a 400 with the same text."""
+    try:
+        return rule(*args)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 # -- the application ---------------------------------------------------------------------------
@@ -451,7 +461,7 @@ def create_app(
 
     @app.get("/api/settings")
     def get_settings() -> dict[str, Any]:
-        return settings.to_dict()
+        return settings.public_dict()  # the Spotify secret is masked, see Settings.public_dict
 
     @app.put("/api/settings")
     def put_settings(patch: SettingsPatch) -> dict[str, Any]:
@@ -477,6 +487,9 @@ def create_app(
             raise HTTPException(500, f"Could not save the settings: {exc}") from exc
         for key, value in changes.items():
             setattr(settings, key, value)
+        # Providers keep their own reference to the Settings object, but a provider that caches
+        # a derived client (a Spotify API token, say) needs the nudge to rebuild it.
+        providers.configure(settings)
         if "concurrency" in changes:
             jobs.set_concurrency(settings.concurrency)
         if moving:
@@ -491,7 +504,7 @@ def create_app(
             # curation. Track ids are stable, the UI shows the entries as "missing" until the
             # files turn up, and an explicit rescan / delete is where dangling ids are dropped.
             log.info("Library moved to %s (%d change(s) after rescan)", new_dir, changed)
-        return settings.to_dict()
+        return settings.public_dict()
 
     # -- jobs --------------------------------------------------------------------------------
 

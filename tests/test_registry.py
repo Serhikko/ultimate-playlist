@@ -135,7 +135,7 @@ def test_doctor_all(reg: RegProvider) -> None:
     result = providers.doctor_all()
     assert set(result) >= {"regtest", "youtube", "spotify"}
     assert result["regtest"] == [(True, "Registry Test", "fine")]
-    assert result["spotify"][0][:2] == (False, "Spotify")
+    assert result["spotify"][0][:2] == (True, "Spotify")  # public pages need no credentials
     labels = [label for _ok, label, _detail in result["youtube"]]
     assert labels == ["ffmpeg", "JavaScript runtime", "yt-dlp"]
     for checks in result.values():

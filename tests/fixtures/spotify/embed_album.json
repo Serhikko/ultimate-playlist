@@ -1,0 +1,96 @@
+{
+ "type": "album",
+ "name": "Random Access Memories",
+ "uri": "spotify:album:4m2880jivSbbyEGAKfITCa",
+ "id": "4m2880jivSbbyEGAKfITCa",
+ "title": "Random Access Memories",
+ "subtitle": "Daft Punk",
+ "releaseDate": null,
+ "duration": 0,
+ "isPlayable": true,
+ "playabilityReason": "PLAYABLE",
+ "isExplicit": false,
+ "relatedEntityUri": "spotify:album:4m2880jivSbbyEGAKfITCa",
+ "visualIdentity": {
+  "backgroundBase": {
+   "alpha": 255,
+   "blue": 112,
+   "green": 83,
+   "red": 69
+  },
+  "image": [
+   {
+    "url": "https://image-cdn-fa.spotifycdn.com/image/ab67616d00001e029b9b36b0e22870b9f542d937",
+    "maxHeight": 300,
+    "maxWidth": 300
+   },
+   {
+    "url": "https://image-cdn-fa.spotifycdn.com/image/ab67616d000048519b9b36b0e22870b9f542d937",
+    "maxHeight": 64,
+    "maxWidth": 64
+   },
+   {
+    "url": "https://image-cdn-fa.spotifycdn.com/image/ab67616d0000b2739b9b36b0e22870b9f542d937",
+    "maxHeight": 640,
+    "maxWidth": 640
+   }
+  ]
+ },
+ "trackList": [
+  {
+   "uri": "spotify:track:0dEIca2nhcxDUV8C5QkPYb",
+   "uid": "e368d41f4549b2886d2d",
+   "title": "Give Life Back to Music",
+   "subtitle": "Daft Punk",
+   "isExplicit": false,
+   "duration": 275386,
+   "isPlayable": true,
+   "playabilityReason": "PLAYABLE",
+   "entityType": "track"
+  },
+  {
+   "uri": "spotify:track:3ctALmweZBapfBdFiIVpji",
+   "uid": "543450a07c9d8e49015a",
+   "title": "The Game of Love",
+   "subtitle": "Daft Punk",
+   "isExplicit": false,
+   "duration": 322146,
+   "isPlayable": true,
+   "playabilityReason": "PLAYABLE",
+   "entityType": "track"
+  },
+  {
+   "uri": "spotify:track:0oks4FnzhNp5QPTZtoet7c",
+   "uid": "794188fa87fb2e65bfe3",
+   "title": "Giorgio by Moroder",
+   "subtitle": "Daft Punk",
+   "isExplicit": false,
+   "duration": 544626,
+   "isPlayable": true,
+   "playabilityReason": "PLAYABLE",
+   "entityType": "track"
+  },
+  {
+   "uri": "spotify:track:7Bxv0WL7UC6WwQpk9TzdMJ",
+   "uid": "ba46c65c33d9632740a1",
+   "title": "Within",
+   "subtitle": "Daft Punk",
+   "isExplicit": false,
+   "duration": 228506,
+   "isPlayable": true,
+   "playabilityReason": "PLAYABLE",
+   "entityType": "track"
+  },
+  {
+   "uri": "spotify:track:2cGxRwrMyEAp8dEbuZaVv6",
+   "uid": "005412c779c4b969b258",
+   "title": "Instant Crush (feat. Julian Casablancas)",
+   "subtitle": "Daft Punk, Julian Casablancas",
+   "isExplicit": false,
+   "duration": 337560,
+   "isPlayable": false,
+   "playabilityReason": "NOT_AVAILABLE_IN_MARKET",
+   "entityType": "track"
+  }
+ ]
+}

@@ -127,7 +127,9 @@ latter; the zip name and the notices must not say something else).
   UI where `server/app.py` expects it (`Path(__file__).parent / "static"`).
 - Hidden imports: `ultimate_playlist.providers.youtube` and `.spotify` (the registry imports them
   with `importlib`, which static analysis cannot follow: forget these and the frozen app has no
-  providers), plus the uvicorn loop / protocol / lifespan modules uvicorn selects by name.
+  providers; the Spotify helper modules `spotify_meta.py` and `ytmusic_match.py` are imported by
+  `spotify.py` the normal way and need no entry), plus the uvicorn loop / protocol / lifespan
+  modules uvicorn selects by name.
 - yt-dlp ships its own PyInstaller hook (websockets, requests, urllib3, pycryptodomex, certifi,
   and the `yt_dlp_ejs` JavaScript solver files); pyinstaller-hooks-contrib covers uvicorn, anyio
   and pydantic. Test-only packages are excluded.
@@ -157,7 +159,7 @@ bundle), `/api/version` and `/api/status`. `doctor` must print the bundled `bin\
 
 ```text
 # bump version in pyproject.toml and src/ultimate_playlist/__init__.py, commit, then:
-git tag v0.1.0
+git tag v0.2.0
 git push --tags
 ```
 
@@ -186,7 +188,7 @@ shows "Windows protected your PC" the first time; the user clicks "More info" th
 and 5 of the build script with `signtool`.
 
 Unsigned PyInstaller executables are also regularly flagged by Windows Defender and third-party
-antivirus as generic trojans ("Wacatac" and friends) right after extraction: the exe vanishes
+antivirus as generic trojans ("Wacatac" and similar names) right after extraction: the exe vanishes
 into quarantine or "is not a valid Win32 application". `START-HERE.txt` and the README tell the
 user to restore it from Windows Security > Protection history. If a release gets flagged, submit
 the zip at <https://www.microsoft.com/en-us/wdsi/filesubmission> as a false positive; a signed
@@ -211,7 +213,7 @@ something, update the lock file and rebuild:
 uv lock --upgrade-package yt-dlp
 uv sync --all-groups
 uv run pytest -q
-git commit -am "Update yt-dlp" && git tag v0.1.1 && git push && git push --tags
+git commit -am "Update yt-dlp" && git tag v0.2.1 && git push && git push --tags
 ```
 
 The same rebuild refreshes ffmpeg, because `--ffmpeg download` always takes the current

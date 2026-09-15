@@ -165,6 +165,23 @@ def test_progress_updates_are_throttled_but_status_changes_are_not(
 # -- playlists -------------------------------------------------------------------------------
 
 
+def test_parent_names_the_container_when_the_provider_gives_one(make_jobs) -> None:
+    """A Spotify album must not show up in the queue as "Playlist: 13 tracks"."""
+    manager, fake = make_jobs(concurrency=1)
+    original = fake.resolve
+
+    def resolve_with_container(url: str) -> list[TrackRef]:
+        return [
+            replace(r, extra={**r.extra, "container": "Album: Test Album"}) for r in original(url)
+        ]
+
+    fake.resolve = resolve_with_container  # type: ignore[method-assign]
+    parent = manager.submit(playlist_url(3))
+    assert manager.wait_idle(WAIT)
+    assert parent.message == "Album: Test Album (3 tracks)"
+    assert parent.child_count == 3
+
+
 def test_playlist_expands_into_children_in_order(make_jobs, library: Library) -> None:
     manager, fake = make_jobs(concurrency=1)
 

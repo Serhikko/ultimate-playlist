@@ -1,0 +1,47 @@
+{
+ "type": "track",
+ "name": "Give Life Back to Music",
+ "uri": "spotify:track:0dEIca2nhcxDUV8C5QkPYb",
+ "id": "0dEIca2nhcxDUV8C5QkPYb",
+ "title": "Give Life Back to Music",
+ "artists": [
+  {
+   "name": "Daft Punk",
+   "uri": "spotify:artist:4tZwfgrHOc3mvqYlEYSvVi"
+  }
+ ],
+ "releaseDate": {
+  "isoString": "2013-05-20T00:00:00Z"
+ },
+ "duration": 275386,
+ "isPlayable": true,
+ "playabilityReason": "PLAYABLE",
+ "isExplicit": false,
+ "hasVideo": false,
+ "relatedEntityUri": "spotify:artist:4tZwfgrHOc3mvqYlEYSvVi",
+ "visualIdentity": {
+  "backgroundBase": {
+   "alpha": 255,
+   "blue": 112,
+   "green": 83,
+   "red": 69
+  },
+  "image": [
+   {
+    "url": "https://image-cdn-ak.spotifycdn.com/image/ab67616d00001e029b9b36b0e22870b9f542d937",
+    "maxHeight": 300,
+    "maxWidth": 300
+   },
+   {
+    "url": "https://image-cdn-ak.spotifycdn.com/image/ab67616d000048519b9b36b0e22870b9f542d937",
+    "maxHeight": 64,
+    "maxWidth": 64
+   },
+   {
+    "url": "https://image-cdn-ak.spotifycdn.com/image/ab67616d0000b2739b9b36b0e22870b9f542d937",
+    "maxHeight": 640,
+    "maxWidth": 640
+   }
+  ]
+ }
+}

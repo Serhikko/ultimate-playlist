@@ -570,6 +570,138 @@ def test_doctor_with_missing_ffmpeg(
     assert "✗ ffmpeg: Install ffmpeg" in capsys.readouterr().out
 
 
+# -- config ------------------------------------------------------------------------------------
+
+
+def test_config_show_masks_the_secret(
+    tmp_settings: Settings, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert run("config", "show") == 0  # no config.json yet: the defaults
+    out = capsys.readouterr().out
+    assert "Config file:" in out and str(Settings.default_path()) in out
+    assert "concurrency = 2" in out
+    assert "ffmpeg_path = (not set)" in out
+    assert "embed_cover = true" in out
+    assert "js_runtimes = deno, node" in out
+    assert "spotify_client_id = (not set)" in out
+    assert "spotify_client_secret = (not set)" in out
+
+    tmp_settings.spotify_client_id = "abc123"
+    tmp_settings.spotify_client_secret = "hunter2"
+    tmp_settings.save()
+    assert run("config", "show") == 0
+    out = capsys.readouterr().out
+    assert f"library_dir = {tmp_settings.library_dir}" in out
+    assert "spotify_client_id = abc123" in out
+    assert "spotify_client_secret = ********" in out
+    assert "hunter2" not in out
+    for key in cli.CONFIG_KEYS:  # every setting is listed
+        assert f"{key} = " in out
+
+
+def test_config_set_saves_the_value(
+    tmp_settings: Settings, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    tmp_settings.save()
+    assert run("config", "set", "concurrency", "3") == 0
+    assert capsys.readouterr().out.strip() == "concurrency = 3"
+    assert Settings.load().concurrency == 3
+    assert Settings.load().library_dir == tmp_settings.library_dir  # everything else kept
+
+    new_dir = tmp_path / "moved" / "lib"
+    assert not new_dir.exists()
+    assert run("config", "set", "library_dir", str(new_dir)) == 0
+    assert new_dir.is_dir()  # created
+    assert Settings.load().library_dir == new_dir
+
+    assert run("config", "set", "spotify_client_secret", "  hunter2 ") == 0
+    out = capsys.readouterr().out
+    assert "spotify_client_secret = ********" in out and "hunter2" not in out
+    assert Settings.load().spotify_client_secret == "hunter2"  # stripped, stored as-is
+    assert run("config", "set", "spotify-client-id", " abc123 ") == 0  # dashes are fine too
+    assert Settings.load().spotify_client_id == "abc123"
+    assert run("config", "set", "spotify_client_secret", "") == 0  # an empty value clears
+    assert Settings.load().spotify_client_secret == ""
+    assert "spotify_client_secret = (not set)" in capsys.readouterr().out
+
+    assert run("config", "set", "embed_cover", "no") == 0
+    assert Settings.load().embed_cover is False
+    assert run("config", "set", "js_runtimes", "Node, deno") == 0
+    assert Settings.load().js_runtimes == ["node", "deno"]
+    assert run("config", "set", "audio_quality", "192k") == 0
+    assert Settings.load().audio_quality == "192"
+    assert run("config", "set", "audio_format", "M4A") == 0
+    assert Settings.load().audio_format == "m4a"
+    assert run("config", "set", "ffmpeg_path", "") == 0
+    assert Settings.load().ffmpeg_path is None
+
+
+def test_config_set_rejects_bad_values(
+    tmp_settings: Settings, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    tmp_settings.save()
+    cases = [
+        (("concurrency", "9"), "between 1 and 6"),
+        (("concurrency", "lots"), "whole number"),
+        (("colour", "purple"), "Unknown setting 'colour'"),
+        (("spotify_client_id", "ünïcode"), "plain ASCII"),
+        (("spotify_client_secret", "x" * 201), "too long"),
+        (("embed_cover", "maybe"), "true or false"),
+        (("js_runtimes", "foo"), "'foo'"),
+        (("audio_format", "wma"), "mp3, m4a, opus, flac"),
+        (("audio_quality", "banana"), "Audio quality"),
+        (("library_dir", "   "), "cannot be empty"),
+        (("ffmpeg_path", str(tmp_path / "nope" / "ffmpeg.exe")), "ffmpeg was not found"),
+    ]
+    for args, fragment in cases:
+        assert run("config", "set", *args) == 2, args
+        err = capsys.readouterr().err
+        assert fragment in err, (args, err)
+    err_for_unknown = None
+    assert run("config", "set", "nope", "x") == 2
+    err_for_unknown = capsys.readouterr().err
+    for key in cli.CONFIG_KEYS:  # the error lists what can be set
+        assert key in err_for_unknown
+    assert Settings.load() == tmp_settings  # nothing was written by any of the failures
+    blocker = tmp_path / "a-file"
+    blocker.write_text("not a folder", encoding="utf-8")
+    assert run("config", "set", "library_dir", str(blocker / "lib")) == 2
+    assert "Cannot create the library folder" in capsys.readouterr().err
+
+
+def test_config_set_hands_the_settings_to_providers(
+    tmp_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ultimate_playlist import providers
+
+    seen: list[Settings] = []
+    monkeypatch.setattr(providers, "configure", lambda settings: seen.append(settings))
+    assert run("config", "set", "spotify_client_id", "abc123") == 0
+    assert len(seen) == 1 and seen[0].spotify_client_id == "abc123"
+    assert run("config", "set", "concurrency", "99") == 2
+    assert len(seen) == 1  # nothing configured on a rejected value
+
+
+def test_config_set_ignores_the_library_override(
+    tmp_settings: Settings, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`up --library X config set concurrency 5` must not quietly persist X as the library."""
+    tmp_settings.save()
+    assert run("config", "set", "concurrency", "5", library=tmp_path / "elsewhere") == 0
+    assert "--library is ignored" in capsys.readouterr().err
+    loaded = Settings.load()
+    assert loaded.concurrency == 5
+    assert loaded.library_dir == tmp_settings.library_dir
+
+
+def test_config_requires_an_action(capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(["config"]) == 2
+    assert "ACTION" in capsys.readouterr().err
+    assert cli.main(["config", "set", "concurrency"]) == 2  # VALUE is required
+    assert cli.main(["config", "--help"]) == 0
+    assert "show" in capsys.readouterr().out
+
+
 # -- export ------------------------------------------------------------------------------------
 
 

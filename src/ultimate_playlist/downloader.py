@@ -45,6 +45,19 @@ def _drop_sentinels(q: _Queue) -> None:
         q.put(item)
 
 
+def _parent_message(refs: list[TrackRef], count: int) -> str:
+    """Queue text for a link that expanded into several tracks.
+
+    Providers that know what the link was (Spotify puts "Album: <name>" or "Playlist: <name>" in
+    ``TrackRef.extra["container"]``) get it named; everything else stays "Playlist: N tracks".
+    """
+    extra = refs[0].extra if refs else None
+    container = extra.get("container") if isinstance(extra, dict) else None
+    if isinstance(container, str) and container.strip():
+        return f"{container.strip()} ({count} tracks)"
+    return f"Playlist: {count} tracks"
+
+
 class JobManager:
     """Queue + worker threads. Every job mutation happens under one lock."""
 
@@ -441,7 +454,7 @@ class JobManager:
                 status=JobStatus.DONE,
                 child_count=len(children),
                 progress=1.0,
-                message=f"Playlist: {len(children)} tracks",
+                message=_parent_message(refs, len(children)),
             )
             for child, ref in children:
                 if self._claimed_elsewhere(ref.track_id, child, include_queued=True):

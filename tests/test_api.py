@@ -302,6 +302,137 @@ def test_put_settings_ignores_unknown_keys(client: TestClient) -> None:
     assert "colour" not in response.json()
 
 
+# -- Spotify credentials -----------------------------------------------------------------------
+
+MASK = "********"
+
+
+def saved_config() -> dict[str, Any]:
+    return json.loads(Settings.default_path().read_text(encoding="utf-8"))
+
+
+def test_get_settings_masks_the_spotify_secret(client: TestClient, tmp_settings: Settings) -> None:
+    data = client.get("/api/settings").json()
+    assert data["spotify_client_id"] == "" and data["spotify_client_secret"] == ""
+    tmp_settings.spotify_client_id = "abc123"
+    tmp_settings.spotify_client_secret = "hunter2"
+    response = client.get("/api/settings")
+    data = response.json()
+    assert data["spotify_client_id"] == "abc123"  # the id is not sensitive
+    assert data["spotify_client_secret"] == MASK
+    assert "hunter2" not in response.text
+
+
+def test_put_settings_sets_and_keeps_the_spotify_secret(
+    client: TestClient, tmp_settings: Settings
+) -> None:
+    response = client.put(
+        "/api/settings",
+        json={"spotify_client_id": "  abc123 ", "spotify_client_secret": " hunter2\n"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["spotify_client_id"] == "abc123"  # stripped
+    assert response.json()["spotify_client_secret"] == MASK  # never echoed back
+    assert "hunter2" not in response.text
+    assert tmp_settings.spotify_client_id == "abc123"
+    assert tmp_settings.spotify_client_secret == "hunter2"
+    assert saved_config()["spotify_client_secret"] == "hunter2"  # config.json holds it as-is
+
+    # the form sends the whole thing back, mask included: the secret stays what it was
+    response = client.put(
+        "/api/settings",
+        json={"spotify_client_id": "abc123", "spotify_client_secret": MASK, "concurrency": 3},
+    )
+    assert response.status_code == 200, response.text
+    assert tmp_settings.spotify_client_secret == "hunter2"
+    assert tmp_settings.concurrency == 3
+    assert saved_config()["spotify_client_secret"] == "hunter2"
+
+    # a new secret replaces the old one
+    response = client.put("/api/settings", json={"spotify_client_secret": "newer"})
+    assert response.status_code == 200, response.text
+    assert response.json()["spotify_client_secret"] == MASK
+    assert tmp_settings.spotify_client_secret == "newer"
+    assert saved_config()["spotify_client_secret"] == "newer"
+
+    # an empty string clears either field
+    response = client.put(
+        "/api/settings", json={"spotify_client_id": "", "spotify_client_secret": ""}
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["spotify_client_id"] == ""
+    assert response.json()["spotify_client_secret"] == ""
+    assert tmp_settings.spotify_client_id == "" and tmp_settings.spotify_client_secret == ""
+    assert client.get("/api/settings").json()["spotify_client_secret"] == ""
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "fragment"),
+    [
+        ("spotify_client_id", "ünïcode", "plain ASCII"),
+        ("spotify_client_secret", "tab\there", "plain ASCII"),
+        ("spotify_client_secret", "line\nbreak", "plain ASCII"),
+        ("spotify_client_id", "x" * 201, "too long"),
+        ("spotify_client_secret", "y" * 201, "too long"),
+    ],
+)
+def test_put_settings_rejects_bad_spotify_credentials(
+    client: TestClient, tmp_settings: Settings, field: str, value: str, fragment: str
+) -> None:
+    tmp_settings.spotify_client_id = "keep-id"
+    tmp_settings.spotify_client_secret = "keep-secret"
+    response = client.put("/api/settings", json={field: value})
+    assert response.status_code == 400
+    assert fragment in response.json()["detail"]
+    assert tmp_settings.spotify_client_id == "keep-id"  # untouched
+    assert tmp_settings.spotify_client_secret == "keep-secret"
+    assert client.put("/api/settings", json={field: 123}).status_code == 422
+    assert client.put("/api/settings", json={field: ["a"]}).status_code == 422
+
+
+def test_status_never_contains_the_spotify_secret(
+    client: TestClient, tmp_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tmp_settings.spotify_client_id = "abc123"
+    tmp_settings.spotify_client_secret = "hunter2-secret"
+
+    class Leaky:  # a provider that (wrongly) echoes what it was configured with
+        name = "spotify"
+        display_name = "Spotify"
+
+        def matches(self, url: str) -> bool:
+            return False
+
+        def doctor(self, settings: Settings) -> list[tuple[bool, str, str]]:
+            return [(True, f"Spotify ({settings.spotify_client_secret})", "ok, id abc123")]
+
+    monkeypatch.setattr(server_app, "providers", SimpleNamespace(PROVIDERS=[Leaky()]))
+    response = client.get("/api/status")
+    assert response.status_code == 200
+    assert "hunter2-secret" not in response.text
+    check = response.json()["providers"][0]["checks"][0]
+    assert check["label"] == f"Spotify ({MASK})"
+    assert check["detail"] == "ok, id abc123"
+    assert "spotify_client_secret" not in response.json()  # settings are not part of status
+
+
+def test_put_settings_hands_the_live_settings_to_providers(
+    client: TestClient, tmp_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Spotify provider must see new credentials at once, without a restart."""
+    from ultimate_playlist import providers
+
+    seen: list[Settings] = []
+    monkeypatch.setattr(providers, "configure", lambda settings: seen.append(settings))
+    response = client.put("/api/settings", json={"spotify_client_id": "abc123"})
+    assert response.status_code == 200, response.text
+    assert seen == [tmp_settings]  # the very object the JobManager downloads with
+    assert seen[0].spotify_client_id == "abc123"
+    # a rejected update configures nothing
+    assert client.put("/api/settings", json={"concurrency": 99}).status_code == 400
+    assert len(seen) == 1
+
+
 def test_put_settings_creates_missing_library_dir(
     client: TestClient, tmp_path: Path, tmp_settings: Settings, library: Library
 ) -> None:

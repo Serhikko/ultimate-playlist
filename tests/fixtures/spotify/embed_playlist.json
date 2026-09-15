@@ -1,0 +1,126 @@
+{
+ "type": "playlist",
+ "name": "Today’s Top Hits",
+ "uri": "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M",
+ "id": "37i9dQZF1DXcBWIGoYBM5M",
+ "title": "Today’s Top Hits",
+ "subtitle": "Spotify",
+ "coverArt": {
+  "sources": [
+   {
+    "height": null,
+    "width": null,
+    "url": "https://i.scdn.co/image/ab67706f00000002aeedf02d103abf921c9a1868"
+   }
+  ]
+ },
+ "duration": 0,
+ "isPlayable": true,
+ "playabilityReason": "UNKNOWN",
+ "isExplicit": false,
+ "relatedEntityUri": "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M",
+ "visualIdentity": {
+  "backgroundBase": {
+   "alpha": 255,
+   "blue": 83,
+   "green": 83,
+   "red": 83
+  },
+  "image": [
+   {
+    "url": "https://image-cdn-ak.spotifycdn.com/image/ab67706f00000001aeedf02d103abf921c9a1868",
+    "maxHeight": 64,
+    "maxWidth": 64
+   },
+   {
+    "url": "https://image-cdn-ak.spotifycdn.com/image/ab67706f00000002aeedf02d103abf921c9a1868",
+    "maxHeight": 300,
+    "maxWidth": 300
+   },
+   {
+    "url": "https://image-cdn-ak.spotifycdn.com/image/ab67706f00000003aeedf02d103abf921c9a1868",
+    "maxHeight": 640,
+    "maxWidth": 640
+   }
+  ]
+ },
+ "trackList": [
+  {
+   "uri": "spotify:track:3h5T5JypYU7huFiVYhv1dr",
+   "uid": "526e6338483751544d4338",
+   "title": "BbY WOW",
+   "subtitle": "KAROL G, Judeline, rusowsky",
+   "isExplicit": false,
+   "duration": 225834,
+   "isPlayable": true,
+   "playabilityReason": "PLAYABLE",
+   "entityType": "track"
+  },
+  {
+   "uri": "spotify:track:7bxaFZ1O3cHkgLKMsdC3xR",
+   "uid": "6d2f566d4b543975424441",
+   "title": "Loser",
+   "subtitle": "Tame Impala",
+   "isExplicit": true,
+   "duration": 223069,
+   "isPlayable": true,
+   "playabilityReason": "PLAYABLE",
+   "entityType": "track"
+  },
+  {
+   "uri": "spotify:track:20jbSiX29FDX4oQxBXyUEi",
+   "uid": "33466a6d35577649464373",
+   "title": "hate that i made you love me",
+   "subtitle": "Ariana Grande",
+   "isExplicit": false,
+   "duration": 197949,
+   "isPlayable": true,
+   "playabilityReason": "PLAYABLE",
+   "entityType": "track"
+  },
+  {
+   "uri": "spotify:track:0eAuGrXyGFYwur9ARUe7LJ",
+   "uid": "556b796e4767396e376263",
+   "title": "Earrings",
+   "subtitle": "Malcolm Todd",
+   "isExplicit": false,
+   "duration": 151500,
+   "isPlayable": true,
+   "playabilityReason": "PLAYABLE",
+   "entityType": "track"
+  },
+  {
+   "uri": "spotify:track:2FZcjBYK4dTt48q94pJbJD",
+   "uid": "39574a554f516646687434",
+   "title": "Bass Persuades",
+   "subtitle": "Miley Cyrus",
+   "isExplicit": false,
+   "duration": 202460,
+   "isPlayable": true,
+   "playabilityReason": "PLAYABLE",
+   "entityType": "track"
+  },
+  {
+   "uri": "spotify:track:02HyFYmpzt02VJ8k0CqxKj",
+   "uid": "544535656f47797636364d",
+   "title": "Ain't In LA",
+   "subtitle": "ADÉLA",
+   "isExplicit": true,
+   "duration": 184927,
+   "isPlayable": false,
+   "playabilityReason": "NOT_AVAILABLE_IN_MARKET",
+   "entityType": "track"
+  },
+  {
+   "uri": "spotify:track:5hVghJ4KaYES3BFUATCYn0",
+   "uid": "60c5da45f1eb163634d5",
+   "title": "EARFQUAKE",
+   "subtitle": "Tyler, The Creator",
+   "isExplicit": true,
+   "duration": 190072,
+   "isPlayable": true,
+   "playabilityReason": "PLAYABLE",
+   "entityType": "track"
+  }
+ ]
+}

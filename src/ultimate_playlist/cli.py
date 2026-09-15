@@ -6,19 +6,32 @@ import argparse
 import json
 import logging
 import os
+import re
+import shutil
 import sys
 import time
 import urllib.error
 import urllib.request
 import webbrowser
 from collections.abc import Sequence
-from dataclasses import replace
+from dataclasses import fields, replace
 from pathlib import Path
 from typing import Any
 
 from . import __version__
 from .bundled import is_frozen
-from .config import Settings, app_data_dir
+from .config import (
+    MAX_CONCURRENCY,
+    MIN_CONCURRENCY,
+    SECRET_MASK,
+    Settings,
+    app_data_dir,
+    clean_audio_format,
+    clean_audio_quality,
+    clean_concurrency,
+    clean_credential,
+    clean_js_runtimes,
+)
 from .ffmpeg import find_ffmpeg, install_hint
 from .library import Library, LibraryUnavailable
 from .models import JobStatus, Playlist
@@ -29,6 +42,17 @@ OK_MARK = "✓"
 BAD_MARK = "✗"
 DEFAULT_PORT = 8765
 DEFAULT_HOST = "127.0.0.1"
+CONFIG_KEYS: tuple[str, ...] = tuple(f.name for f in fields(Settings))
+_BOOL_WORDS = {
+    "true": True,
+    "yes": True,
+    "on": True,
+    "1": True,
+    "false": False,
+    "no": False,
+    "off": False,
+    "0": False,
+}
 # The ports serve() may end up on: the requested one plus the next ten. Kept equal to
 # server.app.PORT_ATTEMPTS (test_cli guards that) instead of imported, so the CLI does not load
 # FastAPI for `up list`.
@@ -37,6 +61,7 @@ JOIN_TIMEOUT = 3.0  # seconds to wait for /api/version; a closed port refuses at
 JOIN_PAUSE = 1.5  # seconds the "already running" line stays readable before the window closes
 POLL_INTERVAL = 0.2  # seconds between progress checks in `add`
 EXIT_OK, EXIT_FAILURE, EXIT_INTERRUPTED = 0, 1, 130
+EXIT_USAGE = 2  # what argparse uses for a bad command line; `config set` errors are the same kind
 
 # A loopback probe must never go through HTTP_PROXY (set on corporate machines, usually without
 # NO_PROXY=127.0.0.1): the default opener would send it to the proxy, which cannot answer.
@@ -332,6 +357,105 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return EXIT_OK if youtube_ok else EXIT_FAILURE
 
 
+def format_setting(value: object) -> str:
+    """One setting as `config show` prints it: lists comma-joined, booleans lower-case."""
+    if value is None or value == "":
+        return "(not set)"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, list):
+        return ", ".join(str(v) for v in value)
+    return str(value)
+
+
+def parse_setting(key: str, raw: str) -> Any:
+    """Turn the text of `up config set KEY VALUE` into the typed value (ValueError if not).
+
+    The same rules as `PUT /api/settings` (they share config.py's clean_* helpers); creating
+    the library folder is the one side effect, so a typo is caught before anything is saved.
+    """
+    text = raw.strip()
+    if key == "library_dir":
+        if not text:
+            raise ValueError("The library folder cannot be empty.")
+        folder = Path(os.path.abspath(Path(os.path.expandvars(text)).expanduser()))
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ValueError(f"Cannot create the library folder {folder}: {exc}") from exc
+        if not folder.is_dir():
+            raise ValueError(f"{folder} is not a folder.")
+        return folder
+    if key == "audio_format":
+        return clean_audio_format(text)
+    if key == "audio_quality":
+        return clean_audio_quality(text)
+    if key == "ffmpeg_path":
+        if not text:
+            return None  # back to "look on PATH"
+        path = Path(os.path.expandvars(text)).expanduser()
+        if not path.is_file():
+            on_path = shutil.which(str(path))  # a bare "ffmpeg" that PATH resolves is fine
+            if on_path is None:
+                raise ValueError(f"ffmpeg was not found at {path}.")
+            path = Path(on_path)
+        return str(path)
+    if key == "concurrency":
+        try:
+            value = int(text)
+        except ValueError:
+            raise ValueError(
+                f"Concurrency must be a whole number between {MIN_CONCURRENCY} and "
+                f"{MAX_CONCURRENCY}."
+            ) from None
+        return clean_concurrency(value)
+    if key == "embed_cover":
+        if text.lower() not in _BOOL_WORDS:
+            raise ValueError("embed_cover must be true or false.")
+        return _BOOL_WORDS[text.lower()]
+    if key == "js_runtimes":
+        return clean_js_runtimes(re.split(r"[,\s]+", text))
+    if key == "spotify_client_id":
+        return clean_credential(text, "Spotify client ID")
+    if key == "spotify_client_secret":
+        return clean_credential(text, "Spotify client secret")
+    raise ValueError(f"Unknown setting '{key}'. Settings you can change: {', '.join(CONFIG_KEYS)}")
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    if args.config_command == "show":
+        settings = load_settings(args.library)
+        say(f"Config file: {Settings.default_path()}")
+        for key, value in settings.public_dict().items():  # the Spotify secret is masked
+            say(f"{key} = {format_setting(value)}")
+        return EXIT_OK
+
+    key = args.key.strip().lower().replace("-", "_")
+    if key not in CONFIG_KEYS:
+        complain(f"Unknown setting '{args.key}'. Settings you can change: {', '.join(CONFIG_KEYS)}")
+        return EXIT_USAGE
+    try:
+        value = parse_setting(key, args.value)
+    except ValueError as exc:
+        complain(str(exc))
+        return EXIT_USAGE
+    if args.library:
+        complain("Note: --library is ignored by `config set`; it changes the saved config.json.")
+    settings = Settings.load()  # the file, not a --library override that must not be persisted
+    setattr(settings, key, value)
+    try:
+        settings.save()
+    except OSError as exc:
+        complain(f"Could not save the settings: {exc}")
+        return EXIT_FAILURE
+    from . import providers
+
+    providers.configure(settings)
+    shown = SECRET_MASK if key == "spotify_client_secret" and value else format_setting(value)
+    say(f"{key} = {shown}")
+    return EXIT_OK
+
+
 def cmd_rescan(args: argparse.Namespace) -> int:
     from .playlists import PlaylistStore
 
@@ -451,6 +575,26 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "doctor", help="check ffmpeg, the JavaScript runtime and providers"
     ).set_defaults(func=cmd_doctor)
+
+    config = sub.add_parser("config", help="show or change the saved settings (config.json)")
+    config_sub = config.add_subparsers(dest="config_command", metavar="ACTION")
+    config_sub.required = True
+    config_sub.add_parser(
+        "show", help="print every setting (the Spotify client secret is masked)"
+    ).set_defaults(func=cmd_config)
+    config_set = config_sub.add_parser(
+        "set",
+        help="change one setting, e.g. `config set concurrency 3`",
+        description="Change one setting in config.json. Text settings are cleared with an "
+        'empty value (""). The library folder is created if it does not exist.',
+    )
+    config_set.add_argument("key", metavar="KEY", help=f"one of: {', '.join(CONFIG_KEYS)}")
+    config_set.add_argument(
+        "value",
+        metavar="VALUE",
+        help="the new value (true/false for embed_cover, a comma-separated list for js_runtimes)",
+    )
+    config_set.set_defaults(func=cmd_config)
     sub.add_parser("rescan", help="sync the index with the library folder").set_defaults(
         func=cmd_rescan
     )

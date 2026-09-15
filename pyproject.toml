@@ -1,7 +1,7 @@
 [project]
 name = "ultimate-playlist"
-version = "0.1.1"
-description = "Paste a YouTube (or, soon, Spotify) link, get tagged MP3s in one local library, build your ultimate playlist."
+version = "0.2.0"
+description = "Paste YouTube or Spotify links, get tagged MP3s in one local library, build your ultimate playlist."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -10,6 +10,7 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     "mutagen>=1.47",
+    "requests>=2.32",
 ]
 
 [project.scripts]

@@ -932,11 +932,12 @@ wheels = [
 
 [[package]]
 name = "ultimate-playlist"
-version = "0.1.1"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
     { name = "mutagen" },
+    { name = "requests" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "yt-dlp", extra = ["default"] },
 ]
@@ -955,6 +956,7 @@ dev = [
 requires-dist = [
     { name = "fastapi", specifier = ">=0.115" },
     { name = "mutagen", specifier = ">=1.47" },
+    { name = "requests", specifier = ">=2.32" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
     { name = "yt-dlp", extras = ["default"], specifier = ">=2026.1.1" },
 ]
