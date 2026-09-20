@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- The Windows exe no longer sits on a blank window for over twenty seconds at every start. The
+  check for an already running copy asked eleven ports one after the other, and Windows takes
+  about two seconds to refuse each closed one; the ports are now checked at once (about half a
+  second). "Starting Ultimate Playlist..." is printed before the web server code is loaded, with
+  a note that the first start after unpacking can take a minute while Windows checks the files.
+
 ## 0.2.0 (2026-09-15)
 
 Spotify links.

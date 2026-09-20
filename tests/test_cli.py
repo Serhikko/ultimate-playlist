@@ -149,6 +149,7 @@ def test_frozen_second_start_joins_the_running_instance(
         return "http://127.0.0.1:8765/"
 
     monkeypatch.setattr(cli, "running_instance", running)
+    monkeypatch.setattr(cli, "listening_ports", lambda host, ports: list(ports))
     monkeypatch.setattr(cli, "JOIN_PAUSE", 0.0)
     assert cli.main([]) == 0
     out = capsys.readouterr().out
@@ -190,6 +191,7 @@ def test_second_start_finds_the_instance_on_a_fallback_port(
         return f"http://{host}:{port}/" if port == cli.DEFAULT_PORT + 1 else None
 
     monkeypatch.setattr(cli, "running_instance", running)
+    monkeypatch.setattr(cli, "listening_ports", lambda host, ports: list(ports))
     assert cli.main([]) == 0
     assert served == [] and opened == ["http://127.0.0.1:8766/"]
     assert probes == [8765, 8766]
@@ -200,6 +202,26 @@ def test_second_start_finds_the_instance_on_a_fallback_port(
     assert cli.main([]) == 0  # the whole range is scanned before a server is started
     assert served == [8765]
     assert cli.find_running_instance("127.0.0.1", 8765) is None
+
+
+def test_scan_only_asks_ports_that_listen(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Closed ports are told apart by a parallel TCP connect (Windows needs ~2 s to refuse
+    each one), so the whole scan stays well under the time of two sequential refusals."""
+    import socket
+    import time
+
+    asked: list[int] = []
+    monkeypatch.setattr(cli, "running_instance", lambda host, port, timeout=1.0: asked.append(port))
+    with socket.socket() as server:
+        server.bind(("127.0.0.1", 0))
+        server.listen()
+        port = server.getsockname()[1]
+        assert cli.listening_ports("127.0.0.1", [port]) == [port]
+        started = time.perf_counter()
+        assert cli.find_running_instance("127.0.0.1", port) is None
+        assert time.perf_counter() - started < 3.0
+    assert port in asked and len(asked) < cli.PORT_ATTEMPTS
+    assert cli.listening_ports("127.0.0.1", []) == []
 
 
 def test_port_range_matches_the_server() -> None:

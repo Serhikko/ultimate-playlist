@@ -8,12 +8,14 @@ import logging
 import os
 import re
 import shutil
+import socket
 import sys
 import time
 import urllib.error
 import urllib.request
 import webbrowser
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields, replace
 from pathlib import Path
 from typing import Any
@@ -57,7 +59,8 @@ _BOOL_WORDS = {
 # server.app.PORT_ATTEMPTS (test_cli guards that) instead of imported, so the CLI does not load
 # FastAPI for `up list`.
 PORT_ATTEMPTS = 11
-JOIN_TIMEOUT = 3.0  # seconds to wait for /api/version; a closed port refuses at once
+JOIN_TIMEOUT = 3.0  # seconds to wait for /api/version on a port that listens
+LISTEN_TIMEOUT = 0.5  # seconds for the TCP connect that tells a listening port from a closed one
 JOIN_PAUSE = 1.5  # seconds the "already running" line stays readable before the window closes
 POLL_INTERVAL = 0.2  # seconds between progress checks in `add`
 RUNNING_APP_TIMEOUT = 5.0  # seconds a running app gets to answer `config set` / `spotify logout`
@@ -181,14 +184,37 @@ def running_instance(host: str, port: int, timeout: float = JOIN_TIMEOUT) -> str
     return url if isinstance(data, dict) and data.get("version") == __version__ else None
 
 
+def _is_listening(host: str, port: int, timeout: float = LISTEN_TIMEOUT) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def listening_ports(host: str, ports: Sequence[int]) -> list[int]:
+    """The ports something accepts connections on, checked all at once.
+
+    Windows takes about two seconds to refuse a connection to a closed loopback port (it
+    retries the SYN), so asking eleven closed ports one after the other kept the exe's window
+    blank for over twenty seconds on every start. A listening port accepts at once even when
+    the app behind it is busy, so a short timeout, in parallel, loses nothing.
+    """
+    if not ports:
+        return []
+    with ThreadPoolExecutor(max_workers=len(ports)) as pool:
+        flags = list(pool.map(lambda candidate: _is_listening(host, candidate), ports))
+    return [candidate for candidate, open_ in zip(ports, flags, strict=True) if open_]
+
+
 def find_running_instance(host: str, port: int, attempts: int = PORT_ATTEMPTS) -> str | None:
     """The running copy on any port serve() could have chosen: `port` or the next free ones.
 
     When a foreign program holds 8765 the first double-click serves on 8766; the second must
-    find it there instead of starting a third server. A closed port refuses the connection in
-    milliseconds, so the scan costs nothing on a normal start.
+    find it there instead of starting a third server. Only ports that listen at all are asked
+    for their version, so the scan costs a fraction of a second on a normal start.
     """
-    for candidate in range(port, port + attempts):
+    for candidate in listening_ports(host, range(port, port + attempts)):
         url = running_instance(host, candidate)
         if url:
             return url
@@ -247,8 +273,6 @@ def _set_console_title(title: str) -> None:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
-    from .server.app import serve
-
     settings = load_settings(args.library)
     if is_frozen():  # the packaged exe: a console window that must explain itself
         _set_console_title("Ultimate Playlist")
@@ -266,6 +290,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 return EXIT_OK
         browser = "" if args.no_browser else " Your browser will open."
         say(f"Starting Ultimate Playlist...{browser} Close this window to stop.")
+        say("The first start after unpacking can take a minute while Windows checks the files.")
+    # Imported only now: loading FastAPI takes seconds in the exe, and the lines above must be
+    # on screen before that (a second start that joins a running copy never needs it at all).
+    from .server.app import serve
+
     try:
         serve(settings, host=args.host, port=args.port, open_browser=not args.no_browser)
     except OSError as exc:
