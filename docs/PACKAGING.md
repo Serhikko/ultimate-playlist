@@ -159,7 +159,7 @@ bundle), `/api/version` and `/api/status`. `doctor` must print the bundled `bin\
 
 ```text
 # bump version in pyproject.toml and src/ultimate_playlist/__init__.py, commit, then:
-git tag v0.2.0
+git tag v0.2.1
 git push --tags
 ```
 
@@ -213,7 +213,7 @@ something, update the lock file and rebuild:
 uv lock --upgrade-package yt-dlp
 uv sync --all-groups
 uv run pytest -q
-git commit -am "Update yt-dlp" && git tag v0.2.1 && git push && git push --tags
+git commit -am "Update yt-dlp" && git tag v0.2.2 && git push && git push --tags
 ```
 
 The same rebuild refreshes ffmpeg, because `--ffmpeg download` always takes the current

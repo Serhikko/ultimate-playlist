@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.1 (2026-09-26)
 
 - The Windows exe no longer sits on a blank window for over twenty seconds at every start. The
   check for an already running copy asked eleven ports one after the other, and Windows takes
