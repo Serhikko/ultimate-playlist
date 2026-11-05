@@ -2,8 +2,8 @@
 
 For contributors. `models.py` and `providers/base.py` are frozen: the types every module talks
 in and the `Provider` protocol. Everything else is described here and in the module docstrings.
-The second half of this page is the guide for adding a source, with YouTube and Spotify as the
-two worked examples.
+The second half of this page is the guide for adding a source, with YouTube, Spotify and TikTok
+as the worked examples.
 
 Two rules keep the codebase small:
 
@@ -39,7 +39,8 @@ src/ultimate_playlist/
   playlists.py                PlaylistStore (playlists.json) and export_m3u8()
   providers/__init__.py       registry: PROVIDERS, register/unregister, get_provider, provider_by_name, configure, doctor_all
   providers/base.py           FROZEN: Provider protocol, ProviderError / ProviderNotAvailable / DownloadCancelled
-  providers/youtube.py        YouTubeProvider (yt-dlp): resolve, download, convert, tag
+  providers/youtube.py        YouTubeProvider (yt-dlp): resolve, download, convert, tag; the pipeline TikTok reuses
+  providers/tiktok.py         TikTokProvider(YouTubeProvider): TikTok link shapes, short-link expansion, naming, error texts
   providers/spotify.py        SpotifyProvider: Spotify links -> metadata -> YouTube Music match -> YouTubeProvider.download -> re-tag
   providers/spotify_meta.py   Spotify metadata: link parsing, the public embed pages, the Web API as the connected user
   providers/spotify_auth.py   "Connect Spotify": Authorization Code + PKCE with the user's Client ID, the token file, renewal
@@ -197,8 +198,9 @@ Client ID) can implement an optional `configure(self, settings)`; `run_doctor` p
 otherwise.
 
 `_load_builtin()` runs at import time and instantiates
-`ultimate_playlist.providers.youtube.YouTubeProvider` and
-`ultimate_playlist.providers.spotify.SpotifyProvider`, in that order. A provider whose import or
+`ultimate_playlist.providers.youtube.YouTubeProvider`,
+`ultimate_playlist.providers.spotify.SpotifyProvider` and
+`ultimate_playlist.providers.tiktok.TikTokProvider`, in that order. A provider whose import or
 constructor raises is logged and **left out of the registry entirely**, so keep heavy or optional
 imports inside the provider's own modules and report their absence through `doctor()` instead of
 failing at import time.
@@ -797,20 +799,81 @@ account connected.
   if a yt-dlp update changes it, the plain-YouTube fallback takes over (weaker ranking, same
   scoring) and a warning is logged.
 
+## How the TikTok provider does it (the subclass example)
+
+`providers/tiktok.py` adds a second yt-dlp site without a second download pipeline:
+`TikTokProvider` subclasses `YouTubeProvider` and inherits `download()` (`.incoming/`,
+conversion, `write_tags`, `destination_for`, cleanup) unchanged. `YouTubeProvider` exposes three
+hooks for that, and YouTube's own behaviour is their default:
+
+- `ydl_format`: the yt-dlp format selector. TikTok has no audio-only stream of the video, so it
+  asks for `best[format_id!^=download]/bestaudio/best`: the soundtrack of the best
+  non-watermarked video (the watermarked copy ends in TikTok's outro jingle; a prefix match,
+  because yt-dlp renames two of them `download-0` / `download-1`); for a photo slideshow,
+  which has no video, the sound; anything as a last resort. Plain `bestaudio` would pick
+  TikTok's separate "sound" file, which is not what plays in the video. The tests run this
+  selector through yt-dlp's own sorting and selection on TikTok-shaped format lists.
+- `_tags_for(info) -> (artist, title, album)`: `pick_tags`. A named sound gives
+  "<sound artists> - <sound title>" and its album; an "original sound" (`is_generic_sound`:
+  the English name and its translations, `- <owner>` suffix or not, or a sound named after the
+  post's creator) gives "<creator display name> - <caption>", the caption without hashtags
+  (`strip_hashtags`: a tag ends at anything but a letter, mark, digit or "_", so the sentence
+  keeps its punctuation and emoji) or a "Replying to @user" prefix, its first non-empty line,
+  cut after the first sentence or at a word near 80 characters (`clean_caption`), "TikTok post
+  <id>" when no letter, digit or symbol is left. yt-dlp splits the sound's author on ", " and
+  " & " alike; `join_artists` puts two names back as "A & B" and more as "A, B & C".
+- `_explain(error)`: `tiktok.friendly_error`, built on `youtube.explain_error` with TikTok's
+  rules (blocked in your country / private / signed-in only / deleted / page unreadable) and
+  the shared `NETWORK_ERRORS` and `CONVERSION_ERRORS` substrings.
+
+The rest is TikTok's own:
+
+- `matches`: any link on `tiktok.com`, `www.`, `m.`, `vm.`, `vt.tiktok.com` or `tiktokv.com`, so
+  a profile, sound page or live stream reaches `resolve()` and is refused with a sentence
+  saying why and, where there is one, what to paste (`unsupported_message`) instead of the bare
+  "No provider" message.
+- `resolve`: `parse_link` (offline) finds the post id in `/@user/video/<id>`, `/@user/photo/<id>`,
+  `/share/video/<id>`, `/embed/v2/<id>`, `m.tiktok.com/v/<id>.html`; a short link
+  (`vm.`/`vt.tiktok.com/<code>`, `tiktok.com/t/<code>`) is expanded first with one HEAD request
+  (`expand_short_link`, the link-preview User-Agent yt-dlp uses too). That request goes to
+  `TikTokLink.clean_url`, the link rebuilt from the checked host and path: `urlsplit` and
+  requests disagree on where `evil.example\@vm.tiktok.com` ends its host, and userinfo or a
+  port must not reach the network either. An error status without a redirect becomes the
+  rate-limit / try-later text; a short link whose post is gone lands on TikTok's home page and
+  is refused as gone; one that leads to a profile or sound page (shared from the app) gets that
+  page's explanation. Every post is then fetched as `https://www.tiktok.com/@<user>/video/<id>`
+  (`post_url`): the one shape yt-dlp's TikTok extractor accepts for every link form above (it
+  does not know `/photo/`, `/embed/v2/`, `m.tiktok.com/v/<id>.html` nor the bare `tiktok.com`
+  host), and TikTok serves a photo post on its `/video/` address too. One
+  `extract_info(download=False)` gives the queue its title.
+- `doctor`: ffmpeg, yt-dlp (`youtube.ffmpeg_check`, `youtube.ytdlp_check`) and
+  `impersonation_check`; no JavaScript runtime, no account.
+- Browser impersonation: yt-dlp's TikTok extractor fetches every page with `impersonate=True`,
+  which needs curl_cffi. It is a dependency (`yt-dlp[default,curl-cffi]`, bundled in the exe),
+  so requests carry a real browser's TLS and HTTP/2 fingerprint and TikTok's bot checks treat
+  the app like a browser. `impersonation_check` imports `yt_dlp.networking._curlcffi`, which
+  fails exactly when yt-dlp could not use it (missing, or a curl_cffi version yt-dlp does not
+  support). Impersonation does not change where the request comes from: TikTok's status 10204
+  ("Your IP address is blocked from accessing this post") is about the connection's location
+  and stays; its message points at a computer-wide VPN. Where curl_cffi cannot load, yt-dlp's
+  "no impersonate target" notice is logged at DEBUG instead of printed for every download.
+
 ## Adding a provider
 
-The checklist, with the two built-in providers as examples: YouTube is the self-contained kind
+The checklist, with the built-in providers as examples: YouTube is the self-contained kind
 (one library does resolve, download and conversion), Spotify the composite kind (metadata from
-one place, audio delegated to another provider, tags rewritten afterwards).
+one place, audio delegated to another provider, tags rewritten afterwards), TikTok the subclass
+kind (another site yt-dlp supports: subclass `YouTubeProvider`, override its hooks).
 
 1. **One module under `providers/`** with a class that has `name` (short lowercase slug; it
    becomes the first half of every track id and must never change afterwards) and
    `display_name`. Optional and slow imports stay inside that module (module level is fine
    there; `youtube.py` imports `yt_dlp` at the top and exposes `YoutubeDL` so tests can swap in
    a fake) and nothing outside `providers/` imports them.
-2. **`matches(url)`**: hostname and path regexes, offline, no exceptions. Say False to link
-   kinds you cannot download (channels, artists, users) so the user gets the "No provider"
-   message straight away.
+2. **`matches(url)`**: hostname and path regexes, offline, no exceptions. For link kinds you
+   cannot download (channels, artists, users) either say False, so the user gets the generic
+   "No provider" message (YouTube), or own the host and refuse them in `resolve()` with a
+   sentence saying what to paste instead (Spotify, TikTok), which is friendlier.
 3. **`resolve(url)`**: one `TrackRef` per downloadable track, cheap metadata filled in, silent
    drops for unavailable items, `ProviderError` with a sentence a non-programmer understands
    for everything else. Keep `extra` small and JSON-safe.
@@ -830,7 +893,9 @@ one place, audio delegated to another provider, tags rewritten afterwards).
    `spotify_auth.json`.
 7. **Register**: add the `(module, class)` pair to `_load_builtin()` in `providers/__init__.py`.
    Order only matters when two providers claim the same URL. A constructor that raises drops
-   the provider from the registry with a warning.
+   the provider from the registry with a warning. Add the module to `hiddenimports` in
+   `packaging/ultimate-playlist.spec` too: PyInstaller cannot see an import by name, and the
+   packaged exe would silently lack the provider (`test_registry` checks it).
 8. **Tests, offline, always** (see below). No test may reach the network; if a test needs it,
    it is wrong.
 9. **Docs**: a section on this page, the README's "What it does" list, the textbox placeholder

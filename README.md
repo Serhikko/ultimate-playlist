@@ -1,6 +1,6 @@
 # Ultimate Playlist
 
-Paste YouTube or Spotify links, get tagged MP3s with cover art in one folder, sort them into
+Paste YouTube, Spotify or TikTok links, get tagged MP3s with cover art in one folder, sort them into
 playlists, and export the playlists as M3U8 files for a car USB stick, your phone or VLC. A
 built-in player lets you listen without leaving the app.
 
@@ -13,7 +13,7 @@ line. Nothing is uploaded anywhere; the music, the index and the settings stay o
    [Releases page](https://github.com/Serhikko/ultimate-playlist/releases) and unzip it anywhere.
 2. Double-click `UltimatePlaylist.exe`. If Windows says "Windows protected your PC", click
    **More info**, then **Run anyway** (the program is not signed). Your browser opens the app.
-3. Paste a YouTube or Spotify link into the box at the top and press Enter. Finished songs land
+3. Paste a YouTube, Spotify or TikTok link into the box at the top and press Enter. Finished songs land
    in `Music\Ultimate Playlist`.
 
 Updating, uninstalling and the zip's own troubleshooting: [No-install version](#no-install-version-windows).
@@ -25,7 +25,8 @@ macOS, Linux, or running from source: [Requirements](#requirements) onward.
   Spotify tracks, albums, playlists and your Liked Songs (`open.spotify.com` links and
   `spotify:` URIs, see [Spotify](#spotify)). A YouTube `watch?v=...&list=...` link downloads only that one video; a
   `/playlist?list=...` link downloads the whole playlist (private and deleted entries are
-  skipped, the rest are reported per track).
+  skipped, the rest are reported per track). Also TikTok videos and photo slideshows,
+  short links included (see [TikTok](#tiktok)).
 - Downloads the best available audio and converts it to MP3 (VBR, best quality) with ffmpeg.
 - Writes ID3 tags (artist, title, album, source URL) and embeds the cover art.
 - Keeps everything in one flat folder as `Artist - Title.mp3`. The same track is never
@@ -126,6 +127,31 @@ Good to know:
 - **"Spotify connection expired"**: the sign-in was ended (for example you removed the app's
   access in your Spotify account). Click **Connect Spotify** again.
 - Podcast episodes and local files in a playlist are skipped.
+
+## TikTok
+
+Paste the link of a TikTok video or photo slideshow (the one **Share → Copy link** gives you,
+`vm.tiktok.com/...` and `vt.tiktok.com/...` short links included). No account is needed; the
+post has to be public.
+
+- The MP3 is what you hear in the video, taken from the video itself (not TikTok's watermarked
+  copy, which ends in TikTok's outro jingle). A photo slideshow has no video, so its sound is
+  the audio.
+- Naming: a post set to a named sound (a song, or a sound someone uploaded under a name) is
+  `Sound artist - Sound title.mp3`, with the sound's album when TikTok has one. A post with an
+  "original sound" (audio recorded in the post itself) is `Creator - Caption.mp3`: the
+  creator's display name, and the caption without hashtags, cut after its first sentence or at
+  about 80 characters. A post without a caption (or with only punctuation) is
+  `Creator - TikTok post <id>.mp3`.
+- The cover is the post's cover image.
+- Profiles, sound pages and collections (also when shared as a short link) are refused with a
+  message saying what to paste instead; live streams can't be downloaded. Private posts and
+  posts TikTok only shows to signed-in users can't be downloaded either.
+- **"TikTok won't show this post in your country"**: the app already presents itself to TikTok
+  as a browser (browser impersonation, `doctor` shows it under TikTok), so this is TikTok
+  refusing the post to your connection's location, or a post that was removed. If the post
+  plays in your browser only through a VPN, switch on a VPN that covers the whole computer and
+  paste the link again: a VPN browser extension only covers the browser, not Ultimate Playlist.
 
 ## No-install version (Windows)
 
@@ -288,11 +314,14 @@ restriction for LAN use.
   for a single track or for the songs of a playlist; there the album of the YouTube Music
   recording is used (with Spotify connected, the album of your own playlists' songs comes from
   Spotify too).
+- For TikTok links, a named sound gives artist and title, an "original sound" gives the
+  creator and the caption (see [TikTok](#tiktok)).
 - Characters Windows does not allow in file names are dropped, names are capped at 150
   characters, and a clash with a different track gets ` (2)`, ` (3)`, ... appended.
 - Tags are ID3v2: artist, title, album (when known), comment = the source URL (the YouTube
-  video or the Spotify track page), the cover (the video thumbnail, or Spotify's album art),
-  and a hidden `ULTIMATE_PLAYLIST_ID` tag (`youtube:<video id>` or `spotify:<track id>`) so a
+  video, the Spotify track page or the TikTok post), the cover (the video thumbnail, Spotify's
+  album art or the TikTok cover), and a hidden `ULTIMATE_PLAYLIST_ID` tag
+  (`youtube:<video id>`, `spotify:<track id>` or `tiktok:<post id>`) so a
   rescan can recognise a file even after you rename or move it inside the folder. Spotify
   tracks also carry a hidden `YOUTUBE_ID` tag with the video the audio came from, plus album
   artist, track number, release year and ISRC when Spotify provided them. With
@@ -354,8 +383,8 @@ section above; the commands below assume a source checkout.
 
 ## Legal
 
-Downloading audio from YouTube may violate YouTube's Terms of Service and, depending on the
-content and the country you are in, copyright law. Spotify is used for metadata only (its public
+Downloading audio from YouTube or TikTok may violate their Terms of Service and, depending on
+the content and the country you are in, copyright law. Spotify is used for metadata only (its public
 embed pages, or the Web API through your own developer app under Spotify's developer terms);
 no Spotify audio is downloaded and no copy protection is circumvented. This tool is intended for
 personal use with content you have the right to download. You are responsible for how you use
@@ -367,9 +396,11 @@ it. The app uploads nothing and shares nothing; everything stays on your machine
   playlists, Liked Songs with a connected account; audio from YouTube Music). Local web UI with
   a settings dialog, the `up` command line, playlists, M3U8 export, built-in player, Windows
   no-install zip.
+- **0.3**: TikTok videos and photo slideshows, short links included.
 - Not yet: a song downloaded once from a YouTube link and once from a Spotify link is two files
-  (no cross-source de-duplication); whole YouTube channels; signing in to YouTube (private and
-  age-restricted videos); other people's Spotify playlists beyond their first 100 songs (a
+  (no cross-source de-duplication); whole YouTube channels; TikTok profiles and collections;
+  signing in to YouTube or TikTok (private and age-restricted posts); other people's Spotify
+  playlists beyond their first 100 songs (a
   Spotify rule); formats other than MP3 (the setting exists but only MP3 is tested); per-artist
   sub-folders.
 
@@ -377,7 +408,7 @@ it. The app uploads nothing and shares nothing; everything stays on your machine
 
 ```text
 uv sync --all-groups      # runtime + dev dependencies (pytest, httpx, ruff)
-uv run pytest -q          # offline test suite (no network, no real YouTube or Spotify)
+uv run pytest -q          # offline test suite (no network, no real YouTube, Spotify or TikTok)
 uv run ruff check .       # lint
 uv run ruff format .      # format
 ```

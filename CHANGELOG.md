@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.3.0 (2026-11-05)
+
+TikTok links.
+
+- Paste a TikTok video or photo slideshow link (`tiktok.com/@user/video/...`, `.../photo/...`,
+  `vm.tiktok.com/...` / `vt.tiktok.com/...` / `tiktok.com/t/...` short links, `m.tiktok.com`
+  and embed links): the MP3 is the audio of the video itself (not the watermarked copy with
+  TikTok's outro), or a slideshow's sound. No account needed. Library id `tiktok:<post id>`;
+  the same post pasted through another link form is not downloaded twice.
+- Naming: a post set to a named sound is "Sound artist - Sound title" (several artists as
+  "A & B" / "A, B & C"); an "original sound" is "Creator - Caption", the caption without
+  hashtags and cut to about 80 characters.
+- Profiles, sound pages and collections are refused with a message saying what to paste
+  instead, also when they come as a short link shared from the app; live streams can't be
+  downloaded. Private, signed-in-only, deleted and region-blocked posts get their own messages.
+- Browser impersonation: curl_cffi is now a dependency (yt-dlp's `curl-cffi` extra, bundled in
+  the Windows zip), so yt-dlp's requests look like a real browser's to TikTok's bot checks.
+  `doctor` shows it under TikTok. A post TikTok still refuses with "blocked" (status 10204) is
+  refused to your connection's location; the message now says so and points at a VPN for the
+  whole computer (a VPN browser extension does not cover the app).
+- Titles keep their zero-width joiners (YouTube titles too): emoji sequences such as 🏳️‍🌈 and
+  family emoji no longer fall apart, and Persian spelling stays intact. A stray joiner at
+  either end of a word is still removed, and the Spotify to YouTube Music matching ignores
+  joiners, so a title spelled with or without one finds the same song.
+- For contributors: `YouTubeProvider` has three hooks (`ydl_format`, `_tags_for`, `_explain`)
+  that a provider for another yt-dlp site overrides; `TikTokProvider` is the example.
+  `youtube.explain_error`, `ffmpeg_check` and `ytdlp_check` are shared helpers.
+
 ## 0.2.1 (2026-09-26)
 
 - The Windows exe no longer sits on a blank window for over twenty seconds at every start. The

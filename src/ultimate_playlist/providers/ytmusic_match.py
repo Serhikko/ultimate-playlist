@@ -281,7 +281,8 @@ def normalize_text(text: str | None) -> str:
     if not text:
         return ""
     text = unicodedata.normalize("NFKD", text)
-    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    # Zero-width joiners are spelling, not word breaks: "می‌خواهم" and "میخواهم" are one word.
+    text = "".join(ch for ch in text if not unicodedata.combining(ch) and ch not in "‌‍")
     text = text.casefold().replace("&", " and ")
     text = re.sub(r"\b(?:ft|featuring)\b\.?", "feat", text)
     text = re.sub(r"\bfeat\.", "feat", text)

@@ -209,6 +209,8 @@ def test_split_artist_title(title: str, expected: tuple[str, str] | None) -> Non
         ("Title (HD Remaster)", "Title (HD Remaster)"),  # "HD" alone is junk, "HD Remaster" is not
         ("Title (Audio Book)", "Title (Audio Book)"),
         ("Ti\u200btle\u202e (Official Video)\ufeff", "Title"),  # invisible characters
+        ("Song\u200d(Official Video)", "Song"),  # the junk bares a joiner that joins nothing
+        ("Song\u200d| Official Audio", "Song"),
         # a "| tail" is only dropped when it reads like a label / channel / format marker
         ("Song | Vevo Presents", "Song"),
         ("Song | Some Channel TV", "Song"),
@@ -247,6 +249,23 @@ def test_clean_title(title: str, expected: str) -> None:
         ("Art\u202eist - T\ufeffitle", "Artist - Title"),  # bidi override, BOM
         ("A - B\u200b", "A - B"),  # zero-width space: same file as "A - B"
         ("\u200e\u200fA\u2060B\u2064", "AB"),
+        # Zero-width joiners stay inside a word or emoji sequence, and go where they join nothing.
+        ("A - B\u200d", "A - B"),
+        ("\u200cA - B", "A - B"),
+        ("A \u200c- B\u200d\u200b", "A - B"),
+        ("\u200c", "untitled"),
+        (  # the rainbow flag: white flag, variation selector, ZWJ, rainbow
+            "Pride \U0001f3f3\ufe0f\u200d\U0001f308",
+            "Pride \U0001f3f3\ufe0f\u200d\U0001f308",
+        ),
+        # A joiner left at the edge by a later trim (a trailing dot, the length cap) goes too.
+        ("A - B\u200d.", "A - B"),
+        ("A - B\u200d...", "A - B"),
+        ("x" * 149 + "\u200dyyyy", "x" * 149),
+        (
+            "\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645",
+            "\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645",
+        ),
     ],
 )
 def test_safe_filename(name: str, expected: str) -> None:

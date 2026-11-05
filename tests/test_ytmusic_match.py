@@ -91,6 +91,9 @@ def test_normalize_text() -> None:
     assert normalize_text("Rock & Roll") == "rock and roll"
     assert normalize_text("Song ft. Someone") == "song feat someone"
     assert normalize_text("  Many   spaces\t here ") == "many spaces here"
+    # A zero-width (non-)joiner is spelling, not a word break, whichever side has it.
+    assert normalize_text("می‌خواهم") == normalize_text("میخواهم") == "میخواهم"
+    assert normalize_text("Love 👨‍👩 song") == normalize_text("Love 👨👩 song")
     assert normalize_text("") == ""
     assert normalize_text(None) == ""
 

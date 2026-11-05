@@ -44,6 +44,7 @@ def _load_builtin() -> None:
     builtin: list[tuple[str, str]] = [
         ("ultimate_playlist.providers.youtube", "YouTubeProvider"),
         ("ultimate_playlist.providers.spotify", "SpotifyProvider"),
+        ("ultimate_playlist.providers.tiktok", "TikTokProvider"),
     ]
     import importlib
 

@@ -1,12 +1,14 @@
 [project]
 name = "ultimate-playlist"
-version = "0.2.1"
-description = "Paste YouTube or Spotify links, get tagged MP3s in one local library, build your ultimate playlist."
+version = "0.3.0"
+description = "Paste YouTube, Spotify or TikTok links, get tagged MP3s in one local library, build your ultimate playlist."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
-    "yt-dlp[default]>=2026.1.1",
+    # curl-cffi: browser impersonation; yt-dlp's TikTok extractor asks for it on every page so
+    # that TikTok's bot checks see a browser.
+    "yt-dlp[default,curl-cffi]>=2026.1.1",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     "mutagen>=1.47",

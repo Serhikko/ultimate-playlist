@@ -1,6 +1,9 @@
 """YouTube provider built on yt-dlp.
 
-This is the only module in the project that imports yt-dlp or knows YouTube URL shapes.
+This module owns the yt-dlp download pipeline (download, convert, tag, name, move into the
+library) and is the only one that knows YouTube URL shapes. `tiktok.py` reuses the pipeline by
+subclassing `YouTubeProvider`: it overrides the format selector (`ydl_format`), the naming
+(`_tags_for`) and the error texts (`_explain`).
 The pure helpers (``split_artist_title``, ``clean_title``, ``safe_filename``, ``unique_path``,
 ``pick_artist_title``, ``friendly_error``, ``_ydl_opts``) never touch the network so they can be
 unit-tested offline.
@@ -13,6 +16,7 @@ import os
 import re
 import shutil
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -101,8 +105,13 @@ _TOPIC_RE = re.compile(r"\s*-\s*Topic\s*$", re.IGNORECASE)
 
 _ILLEGAL_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
 # Zero-width spaces, BOM, bidi overrides and other invisible format characters that get
-# copy-pasted into YouTube titles; they must not end up in file names or tags.
-_INVISIBLE_RE = re.compile("[\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]")
+# copy-pasted into YouTube titles; they must not end up in file names or tags. The zero-width
+# joiner and non-joiner (U+200D, U+200C) stay: they hold emoji sequences together (the rainbow
+# flag, family emoji) and are part of the spelling in Persian and other scripts.
+_INVISIBLE_RE = re.compile("[\u200b\u200e\u200f\u202a-\u202e\u2060-\u2064\ufeff]")
+# ... but only between two visible characters: a joiner at either end of a word joins nothing,
+# and kept there it would make "A - B\u200d" a different file name from "A - B".
+_STRAY_JOINER_RE = re.compile("(?<!\\S)[\u200c\u200d]+|[\u200c\u200d]+(?!\\S)")
 _HTTP_ERROR_RE = re.compile(r"http error (\d{3})")
 _WINDOWS_RESERVED = frozenset(
     {"CON", "PRN", "AUX", "NUL"}
@@ -112,6 +121,10 @@ _WINDOWS_RESERVED = frozenset(
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _BUG_REPORT_MARKER = "; please report this issue"
+# yt-dlp asks for curl_cffi on every TikTok page it loads. It is a dependency, so the notice only
+# appears where it cannot load (an unsupported interpreter); TikTok's doctor line reports that
+# once, a console warning on every download would add nothing.
+_IMPERSONATION_NOTICE = "attempting impersonation"
 
 
 # --------------------------------------------------------------------------------------------
@@ -143,8 +156,9 @@ def split_artist_title(title: str) -> tuple[str, str] | None:
 
 
 def strip_invisible(text: str) -> str:
-    """Drop zero-width / bidi / BOM characters (they render as nothing or reverse the text)."""
-    return _INVISIBLE_RE.sub("", text or "")
+    """Drop zero-width / bidi / BOM characters (they render as nothing or reverse the text);
+    zero-width joiners stay where they join two characters (emoji sequences, Persian)."""
+    return _STRAY_JOINER_RE.sub("", _INVISIBLE_RE.sub("", text or ""))
 
 
 def clean_title(title: str) -> str:
@@ -171,17 +185,27 @@ def clean_title(title: str) -> str:
         if new == text:
             break
         text = new
-    return re.sub(r"\s+", " ", text)
+    # Junk glued to a word ("Song‍(Official Video)") bares the joiner before it.
+    return strip_invisible(re.sub(r"\s+", " ", text)).strip()
+
+
+def _trim_name(text: str) -> str:
+    """Strip spaces, trailing dots and stray joiners until none is left at either end: a trim
+    can bare a joiner ("B", a joiner, "." loses the dot, then the joiner)."""
+    while True:
+        trimmed = strip_invisible(text).strip().rstrip(". ").strip()
+        if trimmed == text:
+            return text
+        text = trimmed
 
 
 def safe_filename(name: str, max_len: int = MAX_FILENAME_LEN) -> str:
     """Make a Windows-safe file name (no extension handling)."""
     text = re.sub(r"[ \t\r\n\f\v]+", " ", name or "")  # real whitespace -> space first
     text = _ILLEGAL_FILENAME_RE.sub("", text)  # then drop illegal + other control chars
-    text = strip_invisible(text)
-    text = re.sub(r"\s+", " ", text).strip().rstrip(". ").strip()
+    text = _trim_name(re.sub(r"\s+", " ", strip_invisible(text)))
     if len(text) > max_len:
-        text = text[:max_len].rstrip(". ").strip()
+        text = _trim_name(text[:max_len])
     if not text:
         text = "untitled"
     if text.split(".", 1)[0].strip().upper() in _WINDOWS_RESERVED:
@@ -274,26 +298,42 @@ def _clean_error_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+# Substrings of a lower-cased yt-dlp message that mean the network, not the video, failed.
+NETWORK_ERRORS: tuple[str, ...] = (
+    "getaddrinfo failed",
+    "failed to resolve",
+    "name or service not known",
+    "temporary failure in name resolution",
+    "nodename nor servname",
+    "network is unreachable",
+    "no route to host",
+    "connection reset",
+    "connection refused",
+    "unable to download webpage",
+    "unable to download api page",
+    "remote end closed connection",
+    "timed out",
+    "errno 11001",
+    "errno 11004",
+)
+# ... and the ones that mean ffmpeg failed while converting or tagging.
+CONVERSION_ERRORS: tuple[str, ...] = (
+    "ffmpeg",
+    "ffprobe",
+    "postprocessing",
+    "conversion failed",
+    "audio conversion",
+)
+CONVERSION_FAILED = (
+    "Converting the audio failed. Check that ffmpeg is installed (see the doctor page)."
+)
+
+ErrorRules = tuple[tuple[tuple[str, ...], str], ...]
+
 # (substrings to look for in the lower-cased yt-dlp message, friendly explanation)
-_FRIENDLY_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
+_FRIENDLY_RULES: ErrorRules = (
     (
-        (
-            "getaddrinfo failed",
-            "failed to resolve",
-            "name or service not known",
-            "temporary failure in name resolution",
-            "nodename nor servname",
-            "network is unreachable",
-            "no route to host",
-            "connection reset",
-            "connection refused",
-            "unable to download webpage",
-            "unable to download api page",
-            "remote end closed connection",
-            "timed out",
-            "errno 11001",
-            "errno 11004",
-        ),
+        NETWORK_ERRORS,
         "Couldn't reach YouTube. Check your internet connection and try again.",
     ),
     (
@@ -378,25 +418,27 @@ _FRIENDLY_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
         ("unsupported url", "unsupported link"),
         "This link isn't a YouTube video or playlist that can be downloaded.",
     ),
-    (
-        ("ffmpeg", "ffprobe", "postprocessing", "conversion failed", "audio conversion"),
-        "Converting the audio failed. Check that ffmpeg is installed (see the doctor page).",
-    ),
+    (CONVERSION_ERRORS, CONVERSION_FAILED),
 )
 
 
-def friendly_error(exc: BaseException | str) -> str:
-    """Turn a yt-dlp error into something a non-programmer can act on.
-
-    The original message is appended in parentheses (trimmed to ~200 characters) so power users
-    can still search for it.
-    """
+def explain_error(
+    exc: BaseException | str,
+    rules: ErrorRules,
+    status_message: Callable[[int], str | None],
+    fallback: str,
+) -> str:
+    """The first rule whose substring occurs in the cleaned, lower-cased message wins; an HTTP
+    status in the message (`status_message(code)` not None) beats every rule. The original
+    message is appended in parentheses (trimmed to ~200 characters) so power users can still
+    search for it."""
     detail = _clean_error_text(str(exc))
     lowered = detail.lower()
-    message = _http_status_message(lowered)
+    match = _HTTP_ERROR_RE.search(lowered)
+    message = status_message(int(match.group(1))) if match else None
     if message is None:
-        message = "YouTube download failed."
-        for needles, friendly in _FRIENDLY_RULES:
+        message = fallback
+        for needles, friendly in rules:
             if any(needle in lowered for needle in needles):
                 message = friendly
                 break
@@ -405,13 +447,14 @@ def friendly_error(exc: BaseException | str) -> str:
     return f"{message} ({detail})" if detail else message
 
 
-def _http_status_message(lowered: str) -> str | None:
+def friendly_error(exc: BaseException | str) -> str:
+    """Turn a yt-dlp error into something a non-programmer can act on."""
+    return explain_error(exc, _FRIENDLY_RULES, _http_status_message, "YouTube download failed.")
+
+
+def _http_status_message(code: int) -> str | None:
     """An HTTP status in the message beats the substring rules: a 403 while fetching the media
     is the classic stale-signature / out-of-date-yt-dlp failure, not a connectivity problem."""
-    match = _HTTP_ERROR_RE.search(lowered)
-    if not match:
-        return None
-    code = int(match.group(1))
     if code == 403:
         return (
             "YouTube refused to serve the audio. This usually means yt-dlp is out of date; "
@@ -450,7 +493,9 @@ class _YdlLogger:
         ydl_log.debug(msg)
 
     def warning(self, msg: str) -> None:
-        ydl_log.log(self._warn_level, re.sub(r"^\s*WARNING:\s*", "", msg))
+        text = re.sub(r"^\s*WARNING:\s*", "", msg)
+        level = logging.DEBUG if _IMPERSONATION_NOTICE in text else self._warn_level
+        ydl_log.log(level, text)
 
     def error(self, msg: str) -> None:
         text = _clean_error_text(msg)
@@ -557,6 +602,7 @@ def _ydl_opts(
     incoming_dir: Path,
     progress: ProgressCallback,
     cancel: threading.Event,
+    format_selector: str = "bestaudio/best",
 ) -> dict[str, Any]:
     """Build the YoutubeDL option dict for one download (kept separate so tests can inspect it)."""
     fmt = settings.audio_format
@@ -620,7 +666,7 @@ def _ydl_opts(
         postprocessors.append({"key": "EmbedThumbnail", "already_have_thumbnail": False})
 
     opts: dict[str, Any] = {
-        "format": "bestaudio/best",
+        "format": format_selector,
         "outtmpl": str(Path(incoming_dir) / "%(id)s.%(ext)s"),
         "postprocessors": postprocessors,
         "writethumbnail": bool(settings.embed_cover),
@@ -946,9 +992,20 @@ def _js_runtime_check(names: list[str] | tuple[str, ...]) -> tuple[bool, str]:
 class YouTubeProvider:
     name = "youtube"
     display_name = "YouTube"
+    # What download() asks yt-dlp for; a subclass whose site has no audio-only stream overrides it.
+    ydl_format = "bestaudio/best"
 
     def __init__(self, settings: Settings | None = None) -> None:
         self._settings = settings
+
+    def _tags_for(self, info: dict[str, Any]) -> tuple[str, str, str | None]:
+        """(artist, title, album) for the file name and the tags of a downloaded video."""
+        artist, title = pick_artist_title(info)
+        return artist, title, _clean_str(info.get("album"))
+
+    def _explain(self, error: BaseException | str) -> str:
+        """The user-facing text for a yt-dlp error."""
+        return friendly_error(error)
 
     def configure(self, settings: Settings) -> None:
         """Use these (live) settings for resolve()/doctor(); the registry calls this at start."""
@@ -1045,7 +1102,7 @@ class YouTubeProvider:
         incoming.mkdir(parents=True, exist_ok=True)
         fmt = settings.audio_format
         video_id = ref.source_id
-        opts = _ydl_opts(settings, incoming, progress, cancel)
+        opts = _ydl_opts(settings, incoming, progress, cancel, self.ydl_format)
         logger: _YdlLogger = opts["logger"]
         try:
             if cancel.is_set():
@@ -1060,15 +1117,15 @@ class YouTubeProvider:
             info = _single_info(raw_info)
             if info is None:
                 raise ProviderError(
-                    friendly_error(
-                        logger.last_error or "YouTube returned no information for this video"
+                    self._explain(
+                        logger.last_error
+                        or f"{self.display_name} returned no information for this video"
                     )
                 )
             video_id = _clean_str(info.get("id")) or ref.source_id
             produced = _produced_file(incoming, video_id, fmt, info)
 
-            artist, title = pick_artist_title(info)
-            album = _clean_str(info.get("album"))
+            artist, title, album = self._tags_for(info)
             progress(ProgressEvent(JobStatus.CONVERTING, progress=1.0, message="Writing tags"))
             has_cover = write_tags(produced, artist, title, album, ref.url, ref.track_id)
 
@@ -1106,7 +1163,7 @@ class YouTubeProvider:
         except yt_dlp.utils.YoutubeDLError as exc:
             if cancel.is_set():
                 raise DownloadCancelled("Download cancelled") from exc
-            raise ProviderError(friendly_error(exc)) from exc
+            raise ProviderError(self._explain(exc)) from exc
         except Exception as exc:
             log.exception("Unexpected failure downloading %s", ref.url)
             raise ProviderError(f"Download failed: {exc}") from exc
@@ -1117,22 +1174,17 @@ class YouTubeProvider:
 
     # -- diagnostics ---------------------------------------------------------------------------
 
-    def doctor(self, settings: Settings | None = None) -> list[tuple[bool, str, str]]:
-        """Checks honour the user's settings (ffmpeg_path, js_runtimes), like downloads do."""
-        checks: list[tuple[bool, str, str]] = []
+    def _doctor_settings(self, settings: Settings | None) -> Settings | None:
         try:
-            settings = settings if settings is not None else self._current_settings()
+            return settings if settings is not None else self._current_settings()
         except Exception as exc:  # noqa: BLE001 - doctor never raises
             log.debug("Could not load settings for doctor(): %s", exc)
-            settings = None
-        try:
-            ffmpeg = find_ffmpeg(settings.ffmpeg_path if settings else None)
-            if ffmpeg.found:
-                checks.append((True, "ffmpeg", ffmpeg.describe()))
-            else:
-                checks.append((False, "ffmpeg", install_hint()))
-        except Exception as exc:  # noqa: BLE001 - doctor never raises
-            checks.append((False, "ffmpeg", f"Could not check ffmpeg: {exc}"))
+            return None
+
+    def doctor(self, settings: Settings | None = None) -> list[tuple[bool, str, str]]:
+        """Checks honour the user's settings (ffmpeg_path, js_runtimes), like downloads do."""
+        settings = self._doctor_settings(settings)
+        checks: list[tuple[bool, str, str]] = [ffmpeg_check(settings)]
         try:
             names = (
                 list(settings.js_runtimes)
@@ -1143,6 +1195,22 @@ class YouTubeProvider:
             checks.append((ok, "JavaScript runtime", detail))
         except Exception as exc:  # noqa: BLE001
             checks.append((False, "JavaScript runtime", f"Could not check JS runtimes: {exc}"))
-        version = getattr(getattr(yt_dlp, "version", None), "__version__", None) or "unknown"
-        checks.append((True, "yt-dlp", str(version)))
+        checks.append(ytdlp_check())
         return checks
+
+
+def ffmpeg_check(settings: Settings | None) -> tuple[bool, str, str]:
+    """The doctor line for ffmpeg, honouring `ffmpeg_path`. Never raises."""
+    try:
+        ffmpeg = find_ffmpeg(settings.ffmpeg_path if settings else None)
+        if ffmpeg.found:
+            return True, "ffmpeg", ffmpeg.describe()
+        return False, "ffmpeg", install_hint()
+    except Exception as exc:  # noqa: BLE001 - doctor never raises
+        return False, "ffmpeg", f"Could not check ffmpeg: {exc}"
+
+
+def ytdlp_check() -> tuple[bool, str, str]:
+    """The doctor line for yt-dlp: its version."""
+    version = getattr(getattr(yt_dlp, "version", None), "__version__", None) or "unknown"
+    return True, "yt-dlp", str(version)

@@ -125,14 +125,18 @@ latter; the zip name and the notices must not say something else).
   a bundle that never imports them.
 - `datas = collect_data_files("ultimate_playlist", includes=["server/static/*"])` puts the web
   UI where `server/app.py` expects it (`Path(__file__).parent / "static"`).
-- Hidden imports: `ultimate_playlist.providers.youtube` and `.spotify` (the registry imports them
-  with `importlib`, which static analysis cannot follow: forget these and the frozen app has no
-  providers; the Spotify helper modules `spotify_meta.py` and `ytmusic_match.py` are imported by
+- Hidden imports: `ultimate_playlist.providers.youtube`, `.spotify` and `.tiktok`, one per
+  built-in provider (the registry imports them with `importlib`, which static analysis cannot
+  follow: forget one and the frozen app silently lacks that provider; `test_registry` checks
+  the list; the Spotify helper modules `spotify_meta.py` and `ytmusic_match.py` are imported by
   `spotify.py` the normal way and need no entry), plus the uvicorn loop / protocol / lifespan
   modules uvicorn selects by name.
 - yt-dlp ships its own PyInstaller hook (websockets, requests, urllib3, pycryptodomex, certifi,
-  and the `yt_dlp_ejs` JavaScript solver files); pyinstaller-hooks-contrib covers uvicorn, anyio
-  and pydantic. Test-only packages are excluded.
+  curl_cffi, and the `yt_dlp_ejs` JavaScript solver files); pyinstaller-hooks-contrib covers
+  uvicorn, anyio and pydantic. Test-only packages are excluded. curl_cffi (browser
+  impersonation for TikTok, from the `yt-dlp[curl-cffi]` extra) carries its own compiled
+  curl-impersonate; `doctor` in the built exe must show "Browser impersonation: curl_cffi ..."
+  under TikTok.
 
 If a new dependency does not show up in the bundle, add it to `hiddenimports` (modules) or
 `datas` (files) in the spec and rebuild. `build/ultimate-playlist/warn-ultimate-playlist.txt`
@@ -159,7 +163,7 @@ bundle), `/api/version` and `/api/status`. `doctor` must print the bundled `bin\
 
 ```text
 # bump version in pyproject.toml and src/ultimate_playlist/__init__.py, commit, then:
-git tag v0.2.1
+git tag v0.3.0
 git push --tags
 ```
 
@@ -213,7 +217,7 @@ something, update the lock file and rebuild:
 uv lock --upgrade-package yt-dlp
 uv sync --all-groups
 uv run pytest -q
-git commit -am "Update yt-dlp" && git tag v0.2.2 && git push && git push --tags
+git commit -am "Update yt-dlp" && git tag v0.3.1 && git push && git push --tags
 ```
 
 The same rebuild refreshes ffmpeg, because `--ffmpeg download` always takes the current

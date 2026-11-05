@@ -61,11 +61,24 @@ def reg() -> Iterator[RegProvider]:
 
 def test_builtins_are_registered() -> None:
     names = [p.name for p in providers.PROVIDERS]
-    assert names[:2] == ["youtube", "spotify"] or names[-2:] == ["youtube", "spotify"]
+    builtins = ["youtube", "spotify", "tiktok"]
+    assert names[:3] == builtins or names[-3:] == builtins
     assert all(isinstance(p, Provider) for p in providers.PROVIDERS)
     assert providers.provider_by_name("youtube").display_name == "YouTube"
     assert providers.provider_by_name("spotify").display_name == "Spotify"
+    assert providers.provider_by_name("tiktok").display_name == "TikTok"
     assert providers.provider_by_name("nope") is None
+
+
+def test_the_build_spec_bundles_every_builtin_provider() -> None:
+    """The registry imports providers by name, which PyInstaller cannot see: each one must be a
+    hidden import in the spec, or the packaged exe silently lacks it."""
+    spec = Path(__file__).resolve().parent.parent / "packaging" / "ultimate-playlist.spec"
+    text = spec.read_text(encoding="utf-8")
+    for provider in providers.PROVIDERS:
+        module = type(provider).__module__
+        if module.startswith("ultimate_playlist.providers."):
+            assert f'"{module}"' in text, f"{module} is missing from the spec's hiddenimports"
 
 
 def test_register_inserts_at_front_and_unregister_removes(reg: RegProvider) -> None:

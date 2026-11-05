@@ -45,9 +45,10 @@ datas = collect_data_files("ultimate_playlist", includes=["server/static/*"])
 
 hiddenimports = [
     # providers/__init__.py imports the built-in providers with importlib, which PyInstaller's
-    # static analysis cannot see; without these two lines the frozen app has no providers.
+    # static analysis cannot see; without these lines the frozen app has no providers.
     "ultimate_playlist.providers.youtube",
     "ultimate_playlist.providers.spotify",
+    "ultimate_playlist.providers.tiktok",
     # uvicorn picks its loop / protocol / lifespan classes by string at runtime. The contrib hook
     # (hook-uvicorn.py) collects every uvicorn submodule too; listing the usual set here keeps
     # the build working even if that hook is missing or changes.
