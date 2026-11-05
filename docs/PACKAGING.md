@@ -163,7 +163,7 @@ bundle), `/api/version` and `/api/status`. `doctor` must print the bundled `bin\
 
 ```text
 # bump version in pyproject.toml and src/ultimate_playlist/__init__.py, commit, then:
-git tag v0.4.0
+git tag v0.5.0
 git push --tags
 ```
 

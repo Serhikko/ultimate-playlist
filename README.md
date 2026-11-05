@@ -524,7 +524,7 @@ it. The app uploads nothing and shares nothing; everything stays on your machine
 - **0.3**: TikTok videos and photo slideshows, short links included.
 - **0.4**: folders (real directories, drag and drop, a Save to choice per
   download), videos as MP4 in four qualities, a video panel in the player.
-- **0.5 (unreleased)**: SoundCloud tracks and sets (albums, EPs, singles, compilations,
+- **0.5**: SoundCloud tracks and sets (albums, EPs, singles, compilations,
   playlists), short links and private links included.
 - Not yet: a song downloaded once from a YouTube link and once from a Spotify link is two files
   (no cross-source de-duplication); whole YouTube channels; TikTok profiles and collections;
