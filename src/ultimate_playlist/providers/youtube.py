@@ -1,9 +1,11 @@
 """YouTube provider built on yt-dlp.
 
 This module owns the yt-dlp download pipeline (download, convert, tag, name, move into the
-library) and is the only one that knows YouTube URL shapes. `tiktok.py` reuses the pipeline by
-subclassing `YouTubeProvider`: it overrides the format selector (`ydl_format`), the naming
-(`_tags_for`) and the error texts (`_explain`).
+library) and is the only one that knows YouTube URL shapes. `tiktok.py` and `soundcloud.py`
+reuse the pipeline by subclassing `YouTubeProvider`: they override the format selector
+(`ydl_format`), the naming (`_tags_for`, or `_tags_for_ref` when the ref knows more, such as the
+album of the set a track came from), the error texts (`_explain`), the source URL written into
+the tags (`_source_url`) and, through `_prepare_ydl`, what yt-dlp does before downloading.
 The pure helpers (``split_artist_title``, ``clean_title``, ``safe_filename``, ``unique_path``,
 ``pick_artist_title``, ``friendly_error``, ``_ydl_opts``) never touch the network so they can be
 unit-tested offline.
@@ -11,12 +13,16 @@ unit-tested offline.
 
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import re
 import shutil
 import tempfile
 import threading
+import time
+import traceback
+import types
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -56,6 +62,7 @@ DEFAULT_JS_RUNTIMES: tuple[str, ...] = ("deno", "node")
 RUNTIME_BINARY: dict[str, str] = {"quickjs": "qjs"}
 MAX_FILENAME_LEN = 150
 _ERROR_DETAIL_LEN = 200
+STAGING_RETRY_DELAY = 0.25  # seconds before the second try at removing a download's folder
 
 _HOSTS = frozenset(
     {
@@ -126,6 +133,9 @@ _BUG_REPORT_MARKER = "; please report this issue"
 # appears where it cannot load (an unsupported interpreter); TikTok's doctor line reports that
 # once, a console warning on every download would add nothing.
 _IMPERSONATION_NOTICE = "attempting impersonation"
+# SoundCloud offers some tracks' original upload to signed-in users only; the stream is what
+# Ultimate Playlist downloads anyway, so the warning on every such track is noise.
+_REGISTERED_ONLY_NOTICE = "Original download format is only available for registered users"
 
 
 # --------------------------------------------------------------------------------------------
@@ -495,7 +505,8 @@ class _YdlLogger:
 
     def warning(self, msg: str) -> None:
         text = re.sub(r"^\s*WARNING:\s*", "", msg)
-        level = logging.DEBUG if _IMPERSONATION_NOTICE in text else self._warn_level
+        quiet = _IMPERSONATION_NOTICE in text or _REGISTERED_ONLY_NOTICE in text
+        level = logging.DEBUG if quiet else self._warn_level
         ydl_log.log(level, text)
 
     def error(self, msg: str) -> None:
@@ -640,6 +651,11 @@ def _ydl_opts(
         "Metadata": "Writing tags",
         "FFmpegMetadata": "Writing tags",
         "EmbedThumbnail": "Embedding cover art",
+        # An HLS download (SoundCloud's AAC) is put back into a proper container first.
+        "FixupM3u8": "Finishing the download",
+        "FFmpegFixupM3u8": "Finishing the download",
+        "FixupM4a": "Finishing the download",
+        "FFmpegFixupM4a": "Finishing the download",
         "MoveFiles": "Finishing up",
         "MoveFilesAfterDownload": "Finishing up",
     }
@@ -814,6 +830,78 @@ def _produced_file(incoming: Path, video_id: str, fmt: str, info: dict[str, Any]
         "The finished file was not produced. Check that ffmpeg is installed "
         "(run the doctor) and try again."
     )
+
+
+def _release_frames(failure: BaseException) -> None:
+    """Let go of the frames below the download that `failure` and the exceptions it came from
+    (its cause and context, the original one yt-dlp keeps in ``exc_info``) still hold: their
+    local variables are cleared (`traceback.clear_frames`) and the tracebacks cut. Clearing is
+    not enough: a frame keeps its function, and yt-dlp's fragment progress hook is a closure
+    over the context that holds the open ``.part`` file. `failure` keeps the first entry of its
+    traceback (`download` itself, the frame it may still be propagating through); the others
+    lose theirs. Nothing reads these tracebacks afterwards: an unexpected error is logged
+    before this runs, and a ProviderError is reported by its text."""
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [failure]
+    while pending:
+        exc = pending.pop()
+        if exc is None or id(exc) in seen:
+            continue
+        seen.add(id(exc))
+        pending += [exc.__cause__, exc.__context__]
+        tb = exc.__traceback__
+        traceback.clear_frames(tb)
+        if exc is failure:
+            if tb is not None:
+                tb.tb_next = None
+        else:
+            exc.__traceback__ = None
+        exc_info = getattr(exc, "exc_info", None)  # yt-dlp's DownloadError, ExtractorError
+        if isinstance(exc_info, tuple) and len(exc_info) == 3:
+            if isinstance(exc_info[1], BaseException):
+                pending.append(exc_info[1])
+            if isinstance(exc_info[2], types.TracebackType):
+                traceback.clear_frames(exc_info[2])
+                exc.exc_info = (exc_info[0], exc_info[1], None)
+
+
+def remove_staging_dir(path: Path, failure: BaseException | None = None) -> bool:
+    """Remove a download's own folder under ``.incoming``; True when it is gone.
+
+    After a failed or cancelled download (`failure`) a file in it may still be open: yt-dlp's
+    HLS downloader (SoundCloud's streams) does not close its ``.part`` file when a progress hook
+    cancels it, and the file object lives on in the exception's frames and in a reference cycle
+    of the downloader's. Windows cannot delete an open file, so those frames are released
+    (`_release_frames`) and the garbage collected first (only when the folder holds something:
+    a download that failed before writing anything opened nothing). If the folder is still
+    there, the removal is tried once more a moment later. Whatever stays behind is swept by a
+    start of the app or `up add` once nothing in it has changed for 12 hours
+    (`downloader.sweep_stale_staging`)."""
+    if failure is not None:
+        _release_frames(failure)
+        if _has_entries(path):
+            gc.collect()
+    shutil.rmtree(path, ignore_errors=True)
+    if path.exists():
+        time.sleep(STAGING_RETRY_DELAY)
+        gc.collect()
+        shutil.rmtree(path, ignore_errors=True)
+    if path.exists():
+        log.warning(
+            "Could not remove %s; a start of the app or `up add` removes it once nothing in it "
+            "has changed for 12 hours (or delete it while the app is closed)",
+            path,
+        )
+        return False
+    return True
+
+
+def _has_entries(path: Path) -> bool:
+    try:
+        with os.scandir(path) as entries:
+            return next(entries, None) is not None
+    except OSError:
+        return False
 
 
 def _fill_id3(
@@ -1046,6 +1134,18 @@ class YouTubeProvider:
         artist, title = pick_artist_title(info)
         return artist, title, _clean_str(info.get("album"))
 
+    def _tags_for_ref(self, ref: TrackRef, info: dict[str, Any]) -> tuple[str, str, str | None]:
+        """(artist, title, album) for a download of `ref`; by default from yt-dlp's info alone."""
+        return self._tags_for(info)
+
+    def _source_url(self, ref: TrackRef, info: dict[str, Any]) -> str:
+        """The link written into the comment tag and Track.source_url."""
+        return ref.url
+
+    def _prepare_ydl(self, ydl: Any) -> None:
+        """Called on the download's YoutubeDL before it runs (e.g. to add a post-processor)."""
+        return None
+
     def _explain(self, error: BaseException | str) -> str:
         """The user-facing text for a yt-dlp error."""
         return friendly_error(error)
@@ -1157,6 +1257,7 @@ class YouTubeProvider:
             )
         video_id = ref.source_id
         logger: _YdlLogger = opts["logger"]
+        failure: BaseException | None = None  # what ended the download, for remove_staging_dir
         try:
             if cancel.is_set():
                 raise DownloadCancelled("Download cancelled")
@@ -1164,6 +1265,7 @@ class YouTubeProvider:
                 ProgressEvent(JobStatus.DOWNLOADING, progress=0.0, message="Starting download")
             )
             with YoutubeDL(opts) as ydl:
+                self._prepare_ydl(ydl)
                 raw_info = ydl.extract_info(ref.url, download=True)
             if cancel.is_set():
                 raise DownloadCancelled("Download cancelled")
@@ -1172,15 +1274,16 @@ class YouTubeProvider:
                 raise ProviderError(
                     self._explain(
                         logger.last_error
-                        or f"{self.display_name} returned no information for this video"
+                        or f"{self.display_name} returned no information for this link"
                     )
                 )
             video_id = _clean_str(info.get("id")) or ref.source_id
             produced = _produced_file(incoming, video_id, fmt, info)
 
-            artist, title, album = self._tags_for(info)
+            artist, title, album = self._tags_for_ref(ref, info)
+            source_url = self._source_url(ref, info)
             progress(ProgressEvent(JobStatus.CONVERTING, progress=1.0, message="Writing tags"))
-            has_cover = write_tags(produced, artist, title, album, ref.url, ref.track_id)
+            has_cover = write_tags(produced, artist, title, album, source_url, ref.track_id)
 
             # The real container decides the extension ("alac" -> .m4a, "vorbis" -> .ogg).
             suffix = produced.suffix.lower() or f".{fmt}"
@@ -1200,7 +1303,7 @@ class YouTubeProvider:
                 id=ref.track_id,
                 provider=self.name,
                 source_id=video_id,
-                source_url=ref.url,
+                source_url=source_url,
                 title=title,
                 artist=artist,
                 path=final.relative_to(dest_dir).as_posix(),
@@ -1209,19 +1312,23 @@ class YouTubeProvider:
                 has_cover=has_cover,
                 file_size=final.stat().st_size,
             )
-        except DownloadCancelled:
-            raise
-        except ProviderError:
+        except ProviderError as exc:  # DownloadCancelled included
+            failure = exc
             raise
         except yt_dlp.utils.YoutubeDLError as exc:
+            failure = exc
             if cancel.is_set():
                 raise DownloadCancelled("Download cancelled") from exc
             raise ProviderError(self._explain(exc)) from exc
         except Exception as exc:
+            failure = exc
             log.exception("Unexpected failure downloading %s", ref.url)
             raise ProviderError(f"Download failed: {exc}") from exc
+        except BaseException as exc:  # Ctrl+C in `up add`: the folder goes all the same
+            failure = exc
+            raise
         finally:
-            shutil.rmtree(incoming, ignore_errors=True)  # streams, .part files, thumbnails
+            remove_staging_dir(incoming, failure)  # streams, .part files, thumbnails
 
     # -- diagnostics ---------------------------------------------------------------------------
 

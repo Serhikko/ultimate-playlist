@@ -49,6 +49,7 @@ hiddenimports = [
     "ultimate_playlist.providers.youtube",
     "ultimate_playlist.providers.spotify",
     "ultimate_playlist.providers.tiktok",
+    "ultimate_playlist.providers.soundcloud",
     # uvicorn picks its loop / protocol / lifespan classes by string at runtime. The contrib hook
     # (hook-uvicorn.py) collects every uvicorn submodule too; listing the usual set here keeps
     # the build working even if that hook is missing or changes.

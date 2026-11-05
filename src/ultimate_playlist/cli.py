@@ -808,7 +808,8 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument(
         "--video",
         action="store_true",
-        help="save the video as MP4 instead of the audio (YouTube and TikTok links)",
+        help="save the video as MP4 instead of the audio (YouTube and TikTok links; Spotify and "
+        "SoundCloud links stay audio)",
     )
     add.add_argument(
         "--quality",

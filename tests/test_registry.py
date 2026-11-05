@@ -61,12 +61,13 @@ def reg() -> Iterator[RegProvider]:
 
 def test_builtins_are_registered() -> None:
     names = [p.name for p in providers.PROVIDERS]
-    builtins = ["youtube", "spotify", "tiktok"]
-    assert names[:3] == builtins or names[-3:] == builtins
+    builtins = ["youtube", "spotify", "tiktok", "soundcloud"]
+    assert names[:4] == builtins or names[-4:] == builtins
     assert all(isinstance(p, Provider) for p in providers.PROVIDERS)
     assert providers.provider_by_name("youtube").display_name == "YouTube"
     assert providers.provider_by_name("spotify").display_name == "Spotify"
     assert providers.provider_by_name("tiktok").display_name == "TikTok"
+    assert providers.provider_by_name("soundcloud").display_name == "SoundCloud"
     assert providers.provider_by_name("nope") is None
 
 
@@ -116,6 +117,8 @@ def test_get_provider_with_and_without_scheme(reg: RegProvider) -> None:
     assert providers.get_provider("www.youtube.com/playlist?list=PLabc").name == "youtube"
     assert providers.get_provider("spotify:track:abc").name == "spotify"
     assert providers.get_provider("open.spotify.com/track/abc").name == "spotify"
+    assert providers.get_provider("soundcloud.com/the80m/the-following").name == "soundcloud"
+    assert providers.get_provider("https://on.soundcloud.com/9zRpu").name == "soundcloud"
 
 
 def test_get_provider_unknown() -> None:

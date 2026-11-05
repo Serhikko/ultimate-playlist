@@ -1,5 +1,54 @@
 # Changelog
 
+## Unreleased
+
+SoundCloud links.
+
+- Paste a SoundCloud track or set link (`soundcloud.com/<artist>/<track>`,
+  `soundcloud.com/<artist>/sets/<name>` for albums, EPs, singles, compilations and playlists,
+  private links with their `s-...` part, `on.soundcloud.com` short links, the embedded player
+  and `api.soundcloud.com` / `api-v2.soundcloud.com` links); the share-tracking part of a link
+  is dropped. No account needed. SoundCloud is audio only: with Video picked, the queue says
+  "SoundCloud links are saved as audio". Library id `soundcloud:<track id>`; the same track
+  reached through another link form or through a set is not downloaded twice.
+- A set is read in one request for the whole set (two for a private set of more than five
+  tracks), not one per track, and becomes one download per track. Its queue row says "Album:
+  <title> (N tracks)" (or EP, Single, Compilation, Playlist), and the title of an album, EP,
+  single or compilation becomes the album tag of its tracks.
+- Naming: "Artist - Title" from the track title when SoundCloud lists no artist, lists the
+  uploader (a label such as NCS or Monstercat) or lists the artist named in it (of several
+  listed artists, the first: "Tobu & Diviners - Geometry", listed as "Tobu, Diviners");
+  otherwise the artist SoundCloud lists, else the uploader. A number left of the dash ("634 -
+  Monstercat Call of the Wild: ...") is no artist. Tails such as "[NCS Release]" and "[Free
+  Download]" are removed, with the dash before them. The comment tag holds the track's page (a
+  private track's with its `s-...` part); the cover is SoundCloud's 500x500 artwork, not the
+  original upload (often over a megabyte, at whatever size it was uploaded).
+- Go+ tracks, which SoundCloud only plays as a 30-second preview without a subscription, are
+  refused instead of being saved as 30 seconds, and DRM-protected tracks are refused too.
+  Profiles, likes, reposts, stations, Discover and searches are refused with a message saying
+  what to paste instead, also when they come as a short link; the tracks and sets of accounts
+  that share a name with a SoundCloud page (`soundcloud.com/library/...`) are not. Deleted
+  tracks, private links without their `s-...` part, the rate limit (which SoundCloud often
+  reports as a refusal, HTTP 403: wait a few minutes, then retry the failed tracks), region
+  blocks and site changes that need a newer yt-dlp get their own messages.
+- The queue shows "Finishing the download" while yt-dlp puts an HLS download (SoundCloud's AAC)
+  into a proper container, instead of "Processing (FixupM4a)". yt-dlp's "Original download
+  format is only available for registered users" warning, which many SoundCloud tracks bring,
+  is no longer written to `app.log`.
+- A cancelled or failed download no longer leaves its partial file in `<library>/.incoming` on
+  Windows (yt-dlp's HLS downloader, which SoundCloud's streams use, kept it open). Download
+  folders left there by a crash or a hard kill go when the app or `up add` next starts, once
+  nothing in them has changed for 12 hours.
+- Pasting a link again with a folder picked, for tracks already in Unsorted, refreshes the
+  library view and the folder counts as soon as the tracks have moved (in 0.4.0 they changed
+  only on the next refresh).
+- For contributors: `YouTubeProvider` has three more hooks, `_tags_for_ref(ref, info)` (the
+  tags when the ref knows more than yt-dlp's info, such as the album of the set a track came
+  from), `_source_url(ref, info)` (the link in the comment tag and `Track.source_url`) and
+  `_prepare_ydl(ydl)` (called on the download's `YoutubeDL` before it runs, e.g. to add a
+  post-processor); their defaults leave YouTube and TikTok unchanged. A subclass for a site
+  without video sets `supports_video = False`. `SoundCloudProvider` is the example.
+
 ## 0.4.0 (2026-11-05)
 
 Folders and videos.

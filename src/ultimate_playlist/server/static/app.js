@@ -871,6 +871,11 @@
       state.jobStatus.set(job.id, job.status);
       if (state.firstJobsPoll) continue;
       if (job.status === 'done' && job.track) libraryChanged = true;
+      // A track already in the library that the job moved into its folder: no new track, but
+      // the folders and that track's folder changed.
+      if (job.status === 'skipped' && String(job.message || '').startsWith('Already in library; moved')) {
+        libraryChanged = true;
+      }
       if (job.status === 'error' && previous !== undefined) failures.push(job);
     }
     const ids = new Set(jobs.map((j) => j.id));

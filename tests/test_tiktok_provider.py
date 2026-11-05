@@ -828,7 +828,7 @@ def test_download_errors_are_tiktok_errors(fake_ydl: type[FakeYoutubeDL], tmp_pa
     assert "YouTube" not in str(caught.value)
 
     fake_ydl.result = None
-    with pytest.raises(ProviderError, match="TikTok returned no information"):
+    with pytest.raises(ProviderError, match="TikTok returned no information for this link"):
         TikTokProvider().download(
             _ref(), settings.library_dir, settings, lambda e: None, threading.Event()
         )

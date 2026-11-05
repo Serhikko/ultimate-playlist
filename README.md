@@ -1,8 +1,8 @@
 # Ultimate Playlist
 
-Paste YouTube, Spotify or TikTok links, get tagged MP3s with cover art in one folder, sort them into
-playlists, and export the playlists as M3U8 files for a car USB stick, your phone or VLC. A
-built-in player lets you listen without leaving the app.
+Paste YouTube, Spotify, TikTok or SoundCloud links, get tagged MP3s with cover art in one folder,
+sort them into playlists, and export the playlists as M3U8 files for a car USB stick, your phone
+or VLC. A built-in player lets you listen without leaving the app.
 
 It is a small desktop tool: a local web app (served on `127.0.0.1` only) plus an `up` command
 line. Nothing is uploaded anywhere; the music, the index and the settings stay on your computer.
@@ -13,8 +13,8 @@ line. Nothing is uploaded anywhere; the music, the index and the settings stay o
    [Releases page](https://github.com/Serhikko/ultimate-playlist/releases) and unzip it anywhere.
 2. Double-click `UltimatePlaylist.exe`. If Windows says "Windows protected your PC", click
    **More info**, then **Run anyway** (the program is not signed). Your browser opens the app.
-3. Paste a YouTube, Spotify or TikTok link into the box at the top and press Enter. Finished songs land
-   in `Music\Ultimate Playlist`.
+3. Paste a YouTube, Spotify, TikTok or SoundCloud link into the box at the top and press Enter.
+   Finished songs land in `Music\Ultimate Playlist`.
 
 Updating, uninstalling and the zip's own troubleshooting: [No-install version](#no-install-version-windows).
 macOS, Linux, or running from source: [Requirements](#requirements) onward.
@@ -26,7 +26,9 @@ macOS, Linux, or running from source: [Requirements](#requirements) onward.
   `spotify:` URIs, see [Spotify](#spotify)). A YouTube `watch?v=...&list=...` link downloads only that one video; a
   `/playlist?list=...` link downloads the whole playlist (private and deleted entries are
   skipped, the rest are reported per track). Also TikTok videos and photo slideshows,
-  short links included (see [TikTok](#tiktok)).
+  short links included (see [TikTok](#tiktok)), and SoundCloud tracks and sets (albums, EPs,
+  singles, compilations, playlists), `on.soundcloud.com` short links and private links
+  included (see [SoundCloud](#soundcloud)).
 - Downloads the best available audio and converts it to MP3 (VBR, best quality) with ffmpeg,
   or, with **Video** picked next to the Download button, the video as MP4 in the quality you
   choose (see [Videos](#videos)).
@@ -70,11 +72,13 @@ Switch the toggle next to the link box from **Audio** to **Video** and pick a qu
 | 720p / 480p | about that resolution (the smallest there is when a site has nothing that small, as on TikTok), H.264: small files for a phone |
 
 Videos are YouTube and TikTok (a TikTok photo slideshow has no video; download it as Audio).
-Spotify links stay audio: their songs come from YouTube Music's audio. A video is a library
-item of its own (`youtube:<id>:video`), so a song can be there as MP3 and as MP4. It plays in a
-panel over the library (click it to pause, double-click or **F** for full screen, the **×**
-hides it while it keeps playing); a whole YouTube playlist downloaded as Video into a folder
-is a ready offline playlist for a flight.
+Spotify and SoundCloud links stay audio (Spotify's songs come from YouTube Music's audio, and
+SoundCloud has no video); with Video picked, their queue row says "Spotify links are saved as
+audio" or "SoundCloud links are saved as audio". A video is a library item of its own
+(`youtube:<id>:video`), so a song can be there as MP3 and as MP4. It plays in a panel over the
+library (click it to pause, double-click or **F** for full screen, the **×** hides it while it
+keeps playing); a whole YouTube playlist downloaded as Video into a folder is a ready offline
+playlist for a flight.
 
 ## Spotify
 
@@ -194,6 +198,62 @@ post has to be public.
   refusing the post to your connection's location, or a post that was removed. If the post
   plays in your browser only through a VPN, switch on a VPN that covers the whole computer and
   paste the link again: a VPN browser extension only covers the browser, not Ultimate Playlist.
+
+## SoundCloud
+
+Paste the link of a SoundCloud track or set (the one **Share → Copy link** gives you). No
+account is needed; the app never signs in to SoundCloud.
+
+- Links that work: a track (`soundcloud.com/<artist>/<track>`); a set, which is an album, EP,
+  single, compilation or playlist (`soundcloud.com/<artist>/sets/<name>`); `on.soundcloud.com`
+  short links; the embedded player (`w.soundcloud.com/player/?url=...`) of a track or a set;
+  and `api.soundcloud.com` / `api-v2.soundcloud.com` track and playlist links. `www.` and `m.`
+  links work too. The share-tracking part of a link (`?si=...`, `utm_...`, `?in=...`) and a
+  `#t=` start time are left out.
+- Private tracks and sets: paste the private link with its `s-...` part at the end
+  (`soundcloud.com/<artist>/<track>/s-AbC12`). Without that part SoundCloud answers as if the
+  track did not exist.
+- A set is read in one request for the whole set (two for a private set of more than five
+  tracks), not one per track, and becomes one download per track. Its queue row says what it
+  is: "Album: <title> (8 tracks)", or EP, Single, Compilation or Playlist. Each track shows as
+  "<set title> · track 3" until its download names it. The title of an album, EP, single or
+  compilation becomes the album tag of its tracks; a playlist's name does not, and a track
+  pasted on its own gets no album tag.
+- The library id is `soundcloud:<track id>`, so the same track reached through another link
+  (a short link, the player, a set) is not downloaded twice.
+- Naming: when the track title reads "Artist - Title" (split on a dash, never on `|`), it gives
+  both, provided SoundCloud lists no artist for the track, lists the uploader, or lists the
+  artist named left of the dash (of several listed artists the first is enough: "Tobu &
+  Diviners - Geometry", listed as "Tobu, Diviners", gives `Tobu & Diviners - Geometry.mp3`). So
+  a label such as NCS or Monstercat uploading "angelrot, skrta - brb [NCS Release]" gives
+  `angelrot, skrta - brb.mp3`. A number left of the dash is no artist ("634 - Monstercat Call of
+  the Wild: ..." keeps its whole title, under Monstercat), unless it is the listed artist or the
+  uploader. Otherwise the artist SoundCloud
+  lists is the artist and the whole title is the title ("Sideways (Prod. Mad Real)", listed
+  under MadReal and uploaded by garyvee, is `MadReal - Sideways (Prod. Mad Real).mp3`). Without
+  a listed artist, the uploader's name is the artist. Junk such as `(Official Audio)` and
+  SoundCloud's own tails (`[NCS Release]`, `[Free Download]`, `(FREE DL)`, `[OUT NOW]`) is
+  removed from the title; a track without a title is called `SoundCloud track <id>`.
+- The cover is the track's artwork at 500x500, not the original upload (often over a megabyte,
+  at whatever size it was uploaded). A track without artwork gets its uploader's picture; SoundCloud's grey placeholder
+  is never used, so a track with neither has no cover.
+- Go+ tracks are refused: without a SoundCloud Go+ subscription SoundCloud only plays a
+  30-second preview of them, and the app says so instead of saving those 30 seconds.
+  DRM-protected tracks (some record labels ask SoundCloud for that) can't be downloaded and are
+  refused too. In a set, such a track fails on its own row and the rest of the set continues.
+- Profiles and their tabs (Tracks, Albums, Playlists, Popular tracks...), likes and reposts,
+  stations and the lists SoundCloud builds around a track
+  (`soundcloud.com/<artist>/<track>/recommended`, `/sets` or `/albums`), Discover (its mixes
+  are made for each signed-in listener, and the charts are gone), searches and the pages of
+  your own account (`soundcloud.com/you/...`) can't be downloaded. They are refused with a
+  message saying what to paste instead, also when they come as a short link shared from the
+  app.
+- **"SoundCloud is rate-limiting this computer"** or **"SoundCloud refused the request for this
+  track or playlist"**: SoundCloud allows only so many requests in a short time (about 600 in
+  10 minutes), and a long set, or several sets in a row, can use them up. SoundCloud often says
+  so with a refusal (HTTP 403) rather than a rate-limit error; either way it clears up by
+  itself. Wait a few minutes, then click **Retry** on the failed rows, or paste the link again:
+  the tracks you already have are skipped.
 
 ## No-install version (Windows)
 
@@ -318,7 +378,7 @@ and `uv run python -m ultimate_playlist` are the same as `uv run up`.
 | --- | --- |
 | Music library (the MP3s and MP4s) | `~/Music/Ultimate Playlist` (Windows: the Music folder Explorer shows, so `C:\Users\<you>\Music\Ultimate Playlist` or `C:\Users\<you>\OneDrive\Music\Ultimate Playlist` when OneDrive manages it); your folders are directories inside it |
 | Exported playlists | `<library>/Playlists/<name>.m3u8` |
-| Temporary download files | `<library>/.incoming/` (cleaned up automatically; safe to empty while the app is closed) |
+| Temporary download files | `<library>/.incoming/` (cleaned up automatically: every download removes its own folder, and a folder a crash left behind goes when the app or `up add` next starts, once nothing in it has changed for 12 hours; safe to empty while the app is closed) |
 | Config, index, playlists, log | `~/.ultimate-playlist/` : `config.json`, `library.json`, `playlists.json`, `app.log` |
 | Spotify sign-in (only while connected) | `~/.ultimate-playlist/spotify_auth.json` (plus an empty `spotify_auth.lock`) |
 
@@ -362,16 +422,21 @@ restriction for LAN use.
   Spotify too).
 - For TikTok links, a named sound gives artist and title, an "original sound" gives the
   creator and the caption (see [TikTok](#tiktok)).
+- For SoundCloud links, the track title's own "Artist - Title", else the artist SoundCloud
+  lists and the title, else the uploader and the title; the album is the title of the set the
+  track came from when that set is an album, EP, single or compilation (see
+  [SoundCloud](#soundcloud)).
 - Characters Windows does not allow in file names are dropped, names are capped at 150
   characters, and a clash with a different track gets ` (2)`, ` (3)`, ... appended.
 - Tags are ID3v2: artist, title, album (when known), comment = the source URL (the YouTube
-  video, the Spotify track page or the TikTok post), the cover (the video thumbnail, Spotify's
-  album art or the TikTok cover), and a hidden `ULTIMATE_PLAYLIST_ID` tag
-  (`youtube:<video id>`, `spotify:<track id>` or `tiktok:<post id>`, with `:video` added for a
-  video) so a
-  rescan can recognise a file even after you rename or move it inside the folder. Spotify
-  tracks also carry a hidden `YOUTUBE_ID` tag with the video the audio came from, plus album
-  artist, track number, release year and ISRC when Spotify provided them. With
+  video, the Spotify track page, the TikTok post or the SoundCloud track page, a private
+  track's with its `s-...` part), the cover (the video thumbnail, Spotify's album art, the
+  TikTok cover or SoundCloud's 500x500 artwork), and a hidden `ULTIMATE_PLAYLIST_ID` tag
+  (`youtube:<video id>`, `spotify:<track id>`, `tiktok:<post id>` or `soundcloud:<track id>`,
+  with `:video` added for a video) so a rescan can recognise a file even after you rename or
+  move it inside the folder. Spotify tracks also carry a hidden `YOUTUBE_ID` tag with the
+  video the audio came from, plus album artist, track number, release year and ISRC when
+  Spotify provided them. With
   `audio_format` set to `m4a`, `opus` or `flac` the same fields are written in that container's
   own tag format (MP4 atoms / Vorbis comments); only MP3 is exercised end to end. Videos
   (MP4) carry the same fields as MP4 atoms.
@@ -406,6 +471,16 @@ section above; the commands below assume a source checkout.
   songs, or trouble connecting your Spotify account: see [Spotify](#spotify).
 - **"Could not reach Spotify"**: no internet, or Spotify is down; the YouTube side is not
   involved yet at that point. Try again in a minute.
+- **SoundCloud: "only plays a 30-second preview of this track"**: a Go+ track, which the app
+  does not download. **"protects this track with DRM"**: can't be downloaded either. **"doesn't
+  exist ... or it is private"**: the track or set was deleted, or it is private and the link
+  lost its `s-...` part; paste the full private link. **"rate-limiting this computer"** or
+  **"refused the request for this track or playlist"**: SoundCloud limits how many requests one
+  computer makes in a short time; wait a few minutes, then retry the failed tracks. See
+  [SoundCloud](#soundcloud).
+- **SoundCloud: "SoundCloud's page couldn't be read"**, or **"refused the request"** still
+  long after a pause: SoundCloud changed something and yt-dlp needs an update, as described
+  above for YouTube.
 - **Long paths on Windows**: Windows refuses paths longer than 260 characters unless long paths
   are enabled. The app keeps temporary files short (`<library>/.incoming/dl-<random>/<video id>.mp3`) and caps
   file names at 150 characters, but a deeply nested library folder can still hit the limit. Use a
@@ -431,10 +506,12 @@ section above; the commands below assume a source checkout.
 
 ## Legal
 
-Downloading audio from YouTube or TikTok may violate their Terms of Service and, depending on
-the content and the country you are in, copyright law. Spotify is used for metadata only (its public
+Downloading audio from YouTube, TikTok or SoundCloud may violate their Terms of Service and,
+depending on the content and the country you are in, copyright law. Spotify is used for metadata only (its public
 embed pages, or the Web API through your own developer app under Spotify's developer terms);
-no Spotify audio is downloaded and no copy protection is circumvented. This tool is intended for
+no Spotify audio is downloaded and no copy protection is circumvented. SoundCloud tracks that
+are DRM-protected, or that SoundCloud only previews without a Go+ subscription, are refused,
+not worked around. This tool is intended for
 personal use with content you have the right to download. You are responsible for how you use
 it. The app uploads nothing and shares nothing; everything stays on your machine.
 
@@ -447,10 +524,13 @@ it. The app uploads nothing and shares nothing; everything stays on your machine
 - **0.3**: TikTok videos and photo slideshows, short links included.
 - **0.4**: folders (real directories, drag and drop, a Save to choice per
   download), videos as MP4 in four qualities, a video panel in the player.
+- **0.5 (unreleased)**: SoundCloud tracks and sets (albums, EPs, singles, compilations,
+  playlists), short links and private links included.
 - Not yet: a song downloaded once from a YouTube link and once from a Spotify link is two files
   (no cross-source de-duplication); whole YouTube channels; TikTok profiles and collections;
-  signing in to YouTube or TikTok (private and age-restricted posts); other people's Spotify
-  playlists beyond their first 100 songs (a
+  SoundCloud profiles, likes, reposts, stations and Discover; signing in to YouTube, TikTok or
+  SoundCloud (private and age-restricted posts, SoundCloud Go+ tracks beyond their 30-second
+  preview); other people's Spotify playlists beyond their first 100 songs (a
   Spotify rule); audio formats other than MP3 (the setting exists but only MP3 is tested);
   folders inside folders (the app shows the top level; deeper files count to their top folder).
 
@@ -458,7 +538,7 @@ it. The app uploads nothing and shares nothing; everything stays on your machine
 
 ```text
 uv sync --all-groups      # runtime + dev dependencies (pytest, httpx, ruff)
-uv run pytest -q          # offline test suite (no network, no real YouTube, Spotify or TikTok)
+uv run pytest -q          # offline test suite (no network, no real YouTube, Spotify, TikTok or SoundCloud)
 uv run ruff check .       # lint
 uv run ruff format .      # format
 ```

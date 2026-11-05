@@ -731,6 +731,11 @@ def test_postprocessor_hook_events(tmp_path: Path) -> None:
     assert events[-1].message == "Embedding cover art"
     pp_hook({"status": "started", "postprocessor": "MoveFiles"})
     assert events[-1].message == "Finishing up"
+    # An HLS download (SoundCloud's AAC) is fixed up before it is converted.
+    pp_hook({"status": "started", "postprocessor": "FixupM3u8"})
+    assert events[-1].message == "Finishing the download"
+    pp_hook({"status": "started", "postprocessor": "FixupM4a"})
+    assert events[-1].message == "Finishing the download"
     pp_hook({"status": "started", "postprocessor": "FFmpegExtractAudio"})  # option-key spelling
     assert events[-1].message == "Converting to MP3"
     pp_hook({"status": "started", "postprocessor": "SomethingNew"})
@@ -1084,6 +1089,42 @@ def test_download_success(fake_ydl: type[FakeYoutubeDL], tmp_path: Path) -> None
     outtmpl = Path(ydl.opts["outtmpl"])
     assert outtmpl.name == "%(id)s.%(ext)s"
     assert outtmpl.parent.parent == incoming and outtmpl.parent.name.startswith("dl-")
+
+
+def test_the_subclass_hooks_change_nothing_for_youtube(
+    fake_ydl: type[FakeYoutubeDL], tmp_path: Path
+) -> None:
+    """`_tags_for_ref`, `_source_url` and `_prepare_ydl` (SoundCloud's hooks) default to what
+    YouTube always did: the album comes from yt-dlp (not the ref), the comment tag and the
+    Track carry the ref's URL (not yt-dlp's webpage_url), the YoutubeDL is left as it is."""
+    settings = make_settings(tmp_path)
+    info = {
+        "id": "jNQXAC9IVRw",
+        "title": "Artist - Song",
+        "channel": "c",
+        "album": "From yt-dlp",
+        "webpage_url": "https://www.youtube.com/watch?v=jNQXAC9IVRw&feature=elsewhere",
+    }
+    fake_ydl.result = info
+    fake_ydl.on_extract = _fake_download(info)
+    ref = TrackRef(
+        provider="youtube",
+        source_id="jNQXAC9IVRw",
+        url="https://www.youtube.com/watch?v=jNQXAC9IVRw",
+        album="From the ref",
+    )
+    provider = YouTubeProvider()
+    track = provider.download(
+        ref, settings.library_dir, settings, lambda e: None, threading.Event()
+    )
+    assert (track.artist, track.title, track.album) == ("Artist", "Song", "From yt-dlp")
+    assert track.source_url == ref.url
+    tags = ID3(str(settings.library_dir / track.path))
+    assert tags["TALB"].text == ["From yt-dlp"]
+    assert tags.getall("COMM")[0].text == [ref.url]
+    assert provider._tags_for_ref(ref, info) == provider._tags_for(info)
+    assert provider._source_url(ref, info) == ref.url
+    assert provider._prepare_ydl(object()) is None  # touches nothing (the fake has no PP API)
 
 
 @pytest.mark.parametrize("fmt", OTHER_FORMATS)
@@ -1453,6 +1494,20 @@ def test_download_none_info_uses_logged_error(
             _ref(), settings.library_dir, settings, lambda _e: None, threading.Event()
         )
     assert str(exc_info.value).startswith("This video is age-restricted")
+
+
+def test_download_none_info_without_logged_error(
+    fake_ydl: type[FakeYoutubeDL], tmp_path: Path
+) -> None:
+    """The text is shared by every provider on this pipeline (TikTok posts, SoundCloud tracks),
+    so it speaks of a link, not a video."""
+    settings = make_settings(tmp_path)
+    fake_ydl.result = None
+    with pytest.raises(ProviderError) as exc_info:
+        YouTubeProvider().download(
+            _ref(), settings.library_dir, settings, lambda _e: None, threading.Event()
+        )
+    assert "(YouTube returned no information for this link)" in str(exc_info.value)
 
 
 def test_download_creates_dest_and_incoming(fake_ydl: type[FakeYoutubeDL], tmp_path: Path) -> None:

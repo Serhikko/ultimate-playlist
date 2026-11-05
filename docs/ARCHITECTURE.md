@@ -2,8 +2,8 @@
 
 For contributors. `models.py` and `providers/base.py` are frozen: the types every module talks
 in and the `Provider` protocol. Everything else is described here and in the module docstrings.
-The second half of this page is the guide for adding a source, with YouTube, Spotify and TikTok
-as the worked examples.
+The second half of this page is the guide for adding a source, with YouTube, Spotify, TikTok
+and SoundCloud as the worked examples.
 
 Two rules keep the codebase small:
 
@@ -39,8 +39,11 @@ src/ultimate_playlist/
   playlists.py                PlaylistStore (playlists.json) and export_m3u8()
   providers/__init__.py       registry: PROVIDERS, register/unregister, get_provider, provider_by_name, configure, doctor_all
   providers/base.py           FROZEN: Provider protocol, ProviderError / ProviderNotAvailable / DownloadCancelled
-  providers/youtube.py        YouTubeProvider (yt-dlp): resolve, download, convert, tag; the pipeline TikTok reuses
+  providers/youtube.py        YouTubeProvider (yt-dlp): resolve, download, convert, tag; the pipeline TikTok and
+                              SoundCloud reuse
   providers/tiktok.py         TikTokProvider(YouTubeProvider): TikTok link shapes, short-link expansion, naming, error texts
+  providers/soundcloud.py     SoundCloudProvider(YouTubeProvider): SoundCloud link shapes, short links, sets, naming,
+                              the Go+ refusal, the 500x500 cover, error texts; audio only
   providers/spotify.py        SpotifyProvider: Spotify links -> metadata -> YouTube Music match -> YouTubeProvider.download -> re-tag
   providers/spotify_meta.py   Spotify metadata: link parsing, the public embed pages, the Web API as the connected user
   providers/spotify_auth.py   "Connect Spotify": Authorization Code + PKCE with the user's Client ID, the token file, renewal
@@ -67,8 +70,9 @@ tests/                        offline pytest suite; conftest.py fixtures; fake_p
         v
  resolver thread: job.status = RESOLVING; refs = provider.resolve(url)
         |   media "video": refs become as_video_ref(ref, quality) (track id + ":video",
-        |                  extra media/quality); a provider without `supports_video` (Spotify)
-        |                  keeps audio and the job says "<Provider> links are saved as audio"
+        |                  extra media/quality); a provider without `supports_video` (Spotify,
+        |                  SoundCloud) keeps audio and the job says "<Provider> links are saved
+        |                  as audio"
         |   0 refs -> ERROR  "Nothing to download at that link"
         |   1 ref  -> the same job gets job.track_ref and moves to the download queue
         |   N refs -> the job becomes a parent (status DONE, child_count=N,
@@ -103,6 +107,12 @@ Things worth knowing about that flow:
 - `dest_dir` passed to `download()` is the **library root**. The provider writes intermediate
   files under `<library>/.incoming/dl-*/` (a folder of its own per download; short path,
   Windows MAX_PATH matters) and moves the finished file into the root with `os.replace`.
+  `JobManager.start()` first runs `sweep_stale_staging(library)`: it removes the `dl-*` and
+  `sp-*` folders in `.incoming` that a crash, a hard kill or a file Windows would not let go of
+  left behind, but only those in which nothing (file or folder, at any depth) was modified for
+  `STALE_STAGING_AGE`, 12 hours. The age is what keeps it safe: `up add` may be downloading
+  into the same library next to the server, and a running download writes all the time.
+  Anything else in `.incoming` is left alone, and a folder that can't be read is kept.
 - De-duplication is by `TrackRef.track_id` (`"<provider>:<source_id>"`), checked right before the
   download. The same YouTube video, or the same Spotify track, is therefore downloaded once, no
   matter how many playlists contain it. There is no de-duplication *across* providers: the same
@@ -197,10 +207,25 @@ to every track it hands out (`server.app.track_json`: `media`, `folder`).
   gives its smallest), `merge_output_format` mp4 and `FFmpegVideoRemuxer` instead of
   `FFmpegExtractAudio`. Naming, tagging (MP4 atoms) and the move into place are the audio
   pipeline's. Every download (audio or video) works in its own `.incoming/dl-*` folder,
-  removed in a `finally`: the MP3 and the MP4 of one video may run at once, and yt-dlp names
-  its files after the video id alone. The tests run each quality through yt-dlp's own
+  removed in a `finally` (`remove_staging_dir`): the MP3 and the MP4 of one video may run at
+  once, and yt-dlp names its files after the video id alone. After a failure or a cancel a file
+  in it may still be open: yt-dlp's HLS downloader (FragmentFD, which SoundCloud's streams
+  use) does not close its `.part` when a progress hook raises `DownloadCancelled`, and the file
+  stays reachable from the exception's frames (its fragment progress hook is a closure over the
+  context that holds the file, and a frame keeps its function even after `frame.clear()`) and
+  from a reference cycle. Windows can't delete an open file, so `_release_frames` clears the
+  frames of the exception and of those it came from (cause, context, yt-dlp's `exc_info`) and
+  cuts their tracebacks below `download()`, then `gc.collect()` runs (only when the folder holds
+  something) before the `rmtree`, which is tried once more after `STAGING_RETRY_DELAY` if the
+  folder is still there. An unexpected error is logged before that, so no traceback anyone
+  reads is lost. Whatever still stays is swept by a start at least 12 hours later (above). The tests run each quality through yt-dlp's own
   selection on YouTube- and TikTok-shaped format lists. `Library` picks up
-  `.mp4 .m4v .webm .mkv .mov` on a rescan.
+  `.mp4 .m4v .webm .mkv .mov` on a rescan. A provider whose site has no video says so with
+  `supports_video = False`: SoundCloud sets it (a `YouTubeProvider` subclass inherits `True`),
+  and Spotify has no such attribute, which the `JobManager` reads as False. The resolver then
+  turns a Video request into audio (`media` "audio", no quality) and the job keeps the note
+  "<display name> links are saved as audio", on a set's parent row after its container label
+  ("Album: out of spite (8 tracks); SoundCloud links are saved as audio").
 - **API**: `GET /api/folders` -> `{unsorted, folders: [{name, count}]}`; `POST /api/folders
   {name}`; `PATCH /api/folders/{name} {name}`; `DELETE /api/folders/{name}` (tracks back to
   Unsorted; `note` when the folder stays on disk); `POST /api/library/move {track_ids,
@@ -293,8 +318,10 @@ otherwise.
 
 `_load_builtin()` runs at import time and instantiates
 `ultimate_playlist.providers.youtube.YouTubeProvider`,
-`ultimate_playlist.providers.spotify.SpotifyProvider` and
-`ultimate_playlist.providers.tiktok.TikTokProvider`, in that order. A provider whose import or
+`ultimate_playlist.providers.spotify.SpotifyProvider`,
+`ultimate_playlist.providers.tiktok.TikTokProvider` and
+`ultimate_playlist.providers.soundcloud.SoundCloudProvider`, in that order (no two of them
+claim the same host, so the order decides nothing between them). A provider whose import or
 constructor raises is logged and **left out of the registry entirely**, so keep heavy or optional
 imports inside the provider's own modules and report their absence through `doctor()` instead of
 failing at import time.
@@ -747,7 +774,8 @@ Spotify tags")`, then `write_spotify_tags(path, ref, video_id, cover)` on the st
 Failure handling: `DownloadCancelled` and `ProviderError` propagate as they are; anything else
 becomes `ProviderError("Spotify download failed: ...")`. If tagging or renaming fails after the
 YouTube step, the staging folder goes with it, so a retry starts clean. (Only a hard kill of
-the process leaves a `.incoming/sp-...` folder behind; it is safe to delete.)
+the process leaves a `.incoming/sp-...` folder behind; it is safe to delete, and
+`sweep_stale_staging` removes it at a start 12 hours later.)
 
 ### Matching heuristics and the acceptance threshold (`ytmusic_match.py`)
 
@@ -900,8 +928,9 @@ account connected.
 
 `providers/tiktok.py` adds a second yt-dlp site without a second download pipeline:
 `TikTokProvider` subclasses `YouTubeProvider` and inherits `download()` (`.incoming/`,
-conversion, `write_tags`, `destination_for`, cleanup) unchanged. `YouTubeProvider` exposes three
-hooks for that, and YouTube's own behaviour is their default:
+conversion, `write_tags`, `destination_for`, cleanup) unchanged. `YouTubeProvider` exposes
+hooks for that, and YouTube's own behaviour is their default. TikTok overrides these three (and
+`ydl_video_format`, see the videos paragraph above; SoundCloud, below, uses three more):
 
 - `ydl_format`: the yt-dlp format selector. TikTok has no audio-only stream of the video, so it
   asks for `best[format_id!^=download]/bestaudio/best`: the soundtrack of the best
@@ -955,12 +984,255 @@ The rest is TikTok's own:
   and stays; its message points at a computer-wide VPN. Where curl_cffi cannot load, yt-dlp's
   "no impersonate target" notice is logged at DEBUG instead of printed for every download.
 
+## How the SoundCloud provider does it (the subclass with sets)
+
+`providers/soundcloud.py` is the second `YouTubeProvider` subclass. `SoundCloudProvider`
+inherits `download()` too and changes it through hooks only. Like TikTok it overrides:
+
+- `ydl_format`: `bestaudio[format_id!*=preview]/best[format_id!*=preview]`, the best stream
+  that is not one of SoundCloud's 30-second previews (yt-dlp gives those a `format_id` ending
+  in `_preview`). A Go+ track, which SoundCloud only previews to listeners without a
+  subscription, has nothing else, so yt-dlp fails with "Requested format is not available",
+  which the error rules below turn into `GO_PLUS` instead of a 30-second file. The tests run
+  this selector through yt-dlp's own selection on SoundCloud-shaped format lists: the AAC HLS
+  streams give `hls_aac_160k`, a legacy MP3 track `http_mp3_0_0`, previews next to the full
+  track never win, previews alone are refused.
+- `_tags_for(info)`: `pick_tags` (naming, below).
+- `_explain(error)`: `soundcloud.friendly_error` (errors, below).
+
+It also uses three hooks `YouTubeProvider.download` gained for it. Their defaults keep YouTube
+and TikTok exactly as they were (`test_the_subclass_hooks_change_nothing_for_youtube`):
+
+- `_tags_for_ref(ref, info) -> (artist, title, album)`, by default `self._tags_for(info)`.
+  SoundCloud's is `pick_tags(info)` with `album or ref.album`: a track of a set is downloaded
+  on its own, so yt-dlp's info names no album and only the ref knows the set's.
+- `_source_url(ref, info) -> str`, the link written into the comment tag and
+  `Track.source_url`, by default `ref.url`. The later tracks of a set come as
+  `api-v2.soundcloud.com/tracks/<id>` links; for an API `ref.url`, SoundCloud's override
+  returns the track's page instead: `info["webpage_url"]` when `parse_link` reads it as a
+  track on `soundcloud.com`, rebuilt by `clean_url`, so a private track keeps its `/s-...`
+  part. A track named like a profile tab (`/<user>/spotlight`, which a set lists by its id)
+  has a page `parse_link` does not take as a track link; it is still used, rebuilt from its
+  `/<user>/<name>[/s-...]` shape, when yt-dlp read this very track (`info["id"]` equals
+  `ref.source_id`). Anything else keeps `ref.url`.
+- `_prepare_ydl(ydl)`, called on the download's `YoutubeDL` right after it is entered, before
+  `extract_info`; by default it does nothing. SoundCloud adds `TrimArtworkPP` there with
+  `when="pre_process"` (cover, below).
+
+And `supports_video = False` (`YouTubeProvider` has True): a Video request for a SoundCloud
+link is saved as audio, with the note (see the videos paragraph above).
+
+The rest is SoundCloud's own:
+
+- **Links** (`parse_link`, offline) give a `SoundCloudLink(kind, host, path, secret, reason)`
+  with kind `track`, `set`, `short` or `other`, or None off SoundCloud. Only http and https;
+  the host is compared exactly with `soundcloud.com`, `www.`, `m.`, `on.`, `api.`, `api-v2.`
+  and `w.soundcloud.com` (`soundcloud.com.evil.example` is none of them), and `www.` and `m.`
+  become `soundcloud.com`.
+  - A track is `/<user>/<track>` or `/<user>/<track>/s-<token>`; a set is `/<user>/sets/<set>`
+    with an optional `/s-<token>`. Names must match `[\w-]+` (what yt-dlp's extractor
+    accepts). A first segment under which every page is SoundCloud's own (`_SITE_SECTIONS`:
+    `discover`, `charts`, `search`, `stations`, `you`, `tags`, `pages`, `settings`,
+    `messages`; SoundCloud's API knows no user of these names) is never a user. The names of
+    SoundCloud's other top-level pages (`_SITE_PAGES`: `upload`, `feed`, `library`, `home`,
+    `jobs`...) are refused only in a page's shape, the name alone or with a profile tab
+    (`/library`, `/library/likes`): `library`, `home` and `jobs` are real accounts too, and
+    `library` has public tracks and sets, so `/<name>/<track>` and `/<name>/sets/<set>` are
+    read like any user's (a site page of that shape that is no track fails with SoundCloud's
+    404).
+  - On `api.` and `api-v2.`: `/tracks/<id>` and `/playlists/<id>` (also the
+    `soundcloud:tracks:<id>` and `soundcloud%3Atracks%3A<id>` forms, rewritten to
+    `/tracks/<id>`), with `?secret_token=s-...` kept; ids are ASCII digits. `/users/...` is a
+    profile.
+  - The player, `w.soundcloud.com/player/?url=<inner>`, stands for its inner link when that
+    is itself a track or a set (the player's own `secret_token` is passed on to an inner API
+    link without one). A player inside a player is not followed, and the player link itself
+    never reaches yt-dlp.
+  - `on.soundcloud.com/<code>` is `short`.
+  - Everything else is `other`, with a `reason`: `profile` (a profile or one of its tabs, an
+    API user), `likes` (likes and reposts), `station` (`/stations/...` and
+    `/<user>/<track>/recommended|albums|sets`), `discover` (`/discover...`, `/charts...`),
+    `search`, `account` (`/you/...`), `embed`, `home` or `page`. `unsupported_message(link)`
+    gives each reason its sentence, which ends with what to paste instead and "(Share, then
+    Copy link)"; `embed`, `home` and `page` share "That SoundCloud link isn't a track or a
+    playlist".
+- **`matches`** is `parse_link(url) is not None`: every page on a SoundCloud host belongs to
+  this provider, so a profile reaches `resolve()` and is refused with its sentence (as on
+  TikTok) rather than the bare "No provider" message.
+- **`SoundCloudLink.clean_url`** is the link rebuilt from the checked host, path and secret
+  (`https://soundcloud.com/<user>/<track>/s-...`, or `?secret_token=s-...` on an API host),
+  and the only form of a pasted link that yt-dlp and the HEAD request see (a set's tracks are
+  then downloaded by the URLs yt-dlp itself gave). The share-tracking query (`?si=`,
+  `utm_*`, `?in=`), a fragment such as `#t=0:30`, a trailing `/`, userinfo, a port and
+  backslash tricks are gone. It also fixes two forms yt-dlp's track extractor does not take:
+  with a trailing `/` or a fragment yt-dlp falls back to its slow generic extractor, and the
+  unencoded `soundcloud:tracks:` form reaches an API that always answers 429. The tests ask the
+  installed yt-dlp's `SoundcloudIE`, `SoundcloudSetIE` and `SoundcloudPlaylistIE` (`suitable()`
+  and the token in their URL pattern) about every rebuilt link.
+- **Short links** (`expand_short_link`): one `requests.head(clean_url,
+  allow_redirects=False, timeout=15)`, sent to `on.soundcloud.com` only, and its `Location`
+  read (a relative one is joined to the short link). The target must parse as a track or a
+  set on `soundcloud.com` (`www.` and `m.` included). One of the pages with a sentence of its
+  own (profile, likes, station, Discover, search, account: a profile shared from the app, say)
+  gets that sentence; anything else (SoundCloud's home page, another host, an API link) is
+  `SHORT_LINK_DEAD`, "That SoundCloud link doesn't lead to a track or a playlist any more (it
+  may have been deleted)." So is an answer that leads nowhere (no `Location` and a status
+  below 400) and a 404 / 410; a 429 says SoundCloud is rate-limiting, a 5xx that it has
+  problems, any other status of 400 or more that it "wouldn't open that short link (HTTP n)",
+  and a network error "Couldn't reach SoundCloud ... (<exception class>)". The target is
+  logged at info level without its query (SoundCloud's `utm_*` share tracking).
+- **`resolve`** calls `_extract(link)`: one `extract_info(clean_url, download=False,
+  ie_key=_extractor_for(link))` with `extract_flat="in_playlist"`, `noplaylist`,
+  `skip_download` and the quiet logger. The extractor is pinned by the parsed kind:
+  `SoundcloudSet` for a set on `soundcloud.com`, `SoundcloudPlaylist` for an API playlist,
+  `Soundcloud` for a track (yt-dlp still checks its `suitable()`). Left to itself yt-dlp takes
+  the first extractor that matches, and `SoundcloudRelated` (the lists built around a track,
+  `/<user>/<track>/recommended|albums|sets`) comes before `SoundcloudSet` and has no end anchor:
+  it takes every set whose name starts with `recommended`, `albums` or `sets`
+  (`/<user>/sets/recommended`, `/<user>/sets/albums-i-love`; real ones are common), reads
+  `/<user>/sets` as a track and lists something else entirely. The tests ask the installed
+  yt-dlp which extractor it would pick for such links, and run one through the real
+  `YoutubeDL` with the extractors' network side replaced. No
+  `cachedir` is set: yt-dlp scrapes SoundCloud's public client id from `soundcloud.com` and
+  keeps it in its own cache (`$XDG_CACHE_HOME/yt-dlp`, else `~/.cache/yt-dlp`), so every later
+  `YoutubeDL` the app makes skips that lookup.
+  - A track comes back complete, formats included (flat extraction only flattens lists).
+    `is_preview_only(info)` (every format a preview: `format_id` ending in `_preview`, or
+    `preference == -10`) raises `ProviderError(GO_PLUS)` before anything is queued; a
+    DRM-protected track already fails in the extraction (yt-dlp's "This video is DRM
+    protected"). The one `TrackRef`: `source_id` is the numeric track id; `url` is the track's
+    page (`webpage_url` through `parse_link` and `clean_url`, so an API, player or short link
+    is downloaded and recorded as the page, a private one with its `/s-...`), else the pasted
+    link's `clean_url`; artist, title and album from `pick_tags`; `duration`; `thumbnail_url`,
+    the last artwork `trim_artwork` keeps (500x500); `extra={"original_url": <the pasted
+    link, normalised>}`.
+  - A set (`_type` "playlist") goes to `_refs_from_set`: one request for the whole set (two
+    for a private set of more than five tracks: SoundCloud sends full track objects for the
+    first five only, and yt-dlp then fetches the rest with the set's token), not one per track,
+    and the flat entries carry an id and a URL but no title. Each entry with an id becomes
+    `TrackRef(provider="soundcloud", source_id=str(id), url=<the entry's URL as yt-dlp gave
+    it>, title="<set title> · track <n>", album=<the set title or None>,
+    extra={"container": "<label>: <set title>"})`. yt-dlp gives the track's page for the first
+    tracks of a set and `https://api-v2.soundcloud.com/tracks/<id>` for the later ones. A
+    track yt-dlp marks as one (`ie_key` Soundcloud) whose page `parse_link` does not take as a
+    track link, a track named like a profile tab such as `/<user>/spotlight`, is listed by its
+    id as `api-v2.soundcloud.com/tracks/<id>` (with `?secret_token=` from a private page's
+    `s-...` part). Any other entry whose URL is not a SoundCloud track link is skipped
+    (`_entry_url` gives None, logged): its id is then not known to be a track's, and a
+    playlist id made into `tracks/<id>` would download some unrelated track. Entries without an id are skipped too (`n` stays the position in the
+    set). The label follows yt-dlp's `album_type`:
+    `album`, `ep`, `single` and `compilation` give Album, EP, Single and Compilation and make
+    the set's title the album of its tracks; anything else, `""` included, is a Playlist
+    without an album. `downloader._parent_message` turns the container into the parent row's
+    "Album: out of spite (8 tracks)". An empty set gives `[]`, which the downloader reports as
+    "Nothing to download at that link".
+  - The placeholder title is safe because `TrackRef.title` of these refs is read through
+    `Job.title` only: the queue row's label (web UI, `up add`'s progress lines, a log line)
+    until the download returns a `Track`, after which it is "Artist - Title". The download
+    names and tags the file from yt-dlp's info of the track itself, never from the ref's title,
+    and the only other reader of ref titles, the Spotify provider, reads its own refs. Without
+    it a row would show the api-v2 link.
+- **Naming** (`pick_tags(info) -> (artist, title, album)`, offline):
+  1. "Artist - Title" split from the title on a dash (` - `, ` – `, ` — `; never on `|`,
+     which on SoundCloud separates a label or a tail: "Still Alive By Boss, Harp | Coin
+     Digital | New Punjabi Songs 2021"), when SoundCloud lists no artist, or the listed artist
+     is the uploader (a label: NCS, Monstercat), or the listed artist and the left side
+     contain one another as whole words, case ignored ("Adele - Hello" by Adele does not
+     become "Adele - Adele - Hello", and "MO" is not in "Mountain Echo"), or the first of the
+     listed names occurs in the left side as a whole word. SoundCloud lists several artists
+     joined with commas ("Tobu, Diviners", "Robin Hustin, Tobimorrow and Jex") where the
+     title joins them with "&", "x" or "and" ("Tobu & Diviners - Geometry"), so the listed
+     artist is split on `,`, ` & `, ` and `, ` x `, ` feat. ` and ` ft. ` (`_first_listed_name`);
+     only the first name counts, so a remixer listed second ("Song - W&W Remix" listed as
+     "Someone, W&W") does not make the title's dash a split. A left side holding "(" is no
+     artist, and neither is one without a letter ("634 - Monstercat Call of the Wild: ...", an
+     episode number; "01 - Intro") unless it is the listed artist or the uploader, as for the
+     band 311 (`_left_names_artist`);
+  2. else the listed artist and the whole cleaned title ("MadReal" and "Sideways (Prod. Mad
+     Real)", uploaded by garyvee);
+  3. else the uploader ("SoundCloud" when there is none) and the title, or "SoundCloud track
+     <id>" when no title is left.
+
+  The listed artist is `artists[0]`, stripped (SoundCloud's publisher metadata), never
+  yt-dlp's `artist`, which joins the list with a FULLWIDTH COMMA in place of each comma
+  ("Boss， Harp"). One without a letter or digit, or one that echoes the title (all of it, or
+  the start of it, more than half of it and not followed by a separator: "BENDY AND THE INK
+  MACHINE SONG (Build Our Machine) INSTRUMENTAL" for a title that goes on "by DAGAMES") is
+  ignored. `clean_sc_title` removes YouTube-style junk (`youtube.clean_title`) and, as often as
+  they repeat, SoundCloud's tails: a `[... Release]` in square brackets only ("(2019 Release)"
+  is a version), `[Free Download]`, `(FREE DL)`, `[OUT NOW]`. After each tail it runs
+  `youtube.clean_title` again, so a separator the tail leaves behind goes too ("Song - [NCS
+  Release]" is "Song", not "Song -", which would reach the tag and the file name); when nothing
+  is left, the raw title stays. The album is yt-dlp's `album` when `album_type` is album, ep,
+  single or compilation; a track resolved on its own has none. The tests hold the trimmed info
+  dicts of real tracks (labels, NCS's comma-listed artists, a remixer, the FULLWIDTH COMMA, the
+  DAGAMES echo, a Monstercat episode, a private track) next to the rule cases.
+- **Errors** (`friendly_error`, on `youtube.explain_error`, where an HTTP status in the
+  message beats the substring rules):
+  - HTTP 401 / 403: `_REFUSED`, "SoundCloud refused the request for this track or playlist.
+    This usually clears up by itself within a few minutes (SoundCloud limits how many requests
+    one computer makes in a short time): wait a few minutes, then retry the failed tracks. If
+    it still happens much later, yt-dlp needs an update". The transient cause comes first
+    because SoundCloud's rate limit often arrives as exactly this: after about 590 API calls in
+    10 minutes every JSON call answered "Unable to download JSON metadata: HTTP Error 403:
+    Forbidden" (resolving a set as well as a track), yt-dlp's retry with a fresh client id got
+    the same, and it cleared by itself within minutes. 429: `_RATE_LIMITED`, which ends "Wait a
+    few minutes, then retry the failed tracks."; 404 / 410: `_NOT_FOUND`, deleted, or private
+    and the link lost its `s-...` part (SoundCloud answers both alike); 5xx: "having problems
+    right now".
+  - The rules, in order: the shared `NETWORK_ERRORS` ("Couldn't reach SoundCloud");
+    `rate limit` / `too many requests` (yt-dlp's own "You have reached the API rate limit,
+    which is ~600 requests per 10 minutes"); `drm protected`; geo restriction (several
+    spellings): "This track isn't available in your country."; `requested format is not
+    available` (the selector above): `GO_PLUS`; `unable to extract client id`: SoundCloud
+    changed its page and a newer yt-dlp is needed; `no video formats found` / `unsupported
+    url`: "That SoundCloud link isn't a track or a playlist."; the shared `CONVERSION_ERRORS`.
+    The fallback is "SoundCloud download failed." The explanation never says YouTube or video
+    (a test checks every rule and status), while yt-dlp's original text, which `explain_error`
+    appends in brackets, may ("This video is DRM protected").
+- **Cover** (`TrimArtworkPP`): yt-dlp writes, and `EmbedThumbnail` embeds, the last
+  thumbnail of its sorted list, which for SoundCloud is the `original` upload, at whatever size
+  it was uploaded and often over a megabyte. As a `pre_process` post-processor `TrimArtworkPP` runs before that
+  choice, and `trim_artwork` drops the original (unless it is all there is) and SoundCloud's
+  grey `default_avatar` placeholder (yt-dlp takes the uploader's picture when a track has no
+  artwork, and that placeholder when the uploader has none). So `t500x500` is written, or no
+  cover at all. Its `_hook_progress` does nothing, so the queue never shows "Processing
+  (TrimArtwork)". `resolve()` takes `thumbnail_url` from the same trimmed list.
+- **Downloads** are `YouTubeProvider.download` with the hooks above: the track id
+  `soundcloud:<id>`, the name from `pick_tags` on the track's own info, `album or ref.album`,
+  the page as source URL. Some `youtube.py` changes came with them: the queue shows
+  "Finishing the download" for yt-dlp's `FixupM3u8` / `FixupM4a` step (SoundCloud's AAC
+  arrives over HLS and is put into a proper container before the conversion); yt-dlp's
+  "Original download format is only available for registered users" warning, which comes with
+  every track whose uploader allows downloads of the original file, is logged at DEBUG like the
+  impersonation notice (the stream is what the app saves anyway); a download yt-dlp returns no
+  information for says "<site> returned no information for this link" (it said "video", wrong
+  for a SoundCloud track or a TikTok post); and a failed or cancelled download closes its open
+  `.part` before its folder is removed (`remove_staging_dir`, see the videos paragraph above),
+  which only SoundCloud's HLS streams left open.
+- **`doctor`**: `youtube.ffmpeg_check` and `ytdlp_check`; no JavaScript runtime, no account.
+  `up doctor` prints them in a SoundCloud block; the web UI has no SoundCloud chip.
+
+Known limitations:
+
+- A Go+ or DRM-protected track inside a set is found only when its own download starts (the
+  flat listing has no formats), so it fails on its own row while the rest of the set
+  continues.
+- No sign-in: Go+ tracks in full and the original files uploaders offer to registered users are
+  out of reach, and a private track needs its secret link.
+- Nothing waits out SoundCloud's rate limit (the provider sets no extractor retries or pauses,
+  and the queue does not pause); a set of a few hundred tracks can run into it, and the failed
+  tracks say to wait and retry: as the rate-limit text (a 429 or yt-dlp's own "API rate
+  limit"), or, as SoundCloud more often answers, as the 403 text, which puts waiting first.
+- Profiles, likes, reposts, stations and Discover are refused, not expanded into their tracks.
+
 ## Adding a provider
 
 The checklist, with the built-in providers as examples: YouTube is the self-contained kind
 (one library does resolve, download and conversion), Spotify the composite kind (metadata from
-one place, audio delegated to another provider, tags rewritten afterwards), TikTok the subclass
-kind (another site yt-dlp supports: subclass `YouTubeProvider`, override its hooks).
+one place, audio delegated to another provider, tags rewritten afterwards), TikTok and
+SoundCloud the subclass kind (another site yt-dlp supports: subclass `YouTubeProvider`, override
+its hooks).
 
 1. **One module under `providers/`** with a class that has `name` (short lowercase slug; it
    becomes the first half of every track id and must never change afterwards) and
@@ -970,7 +1242,7 @@ kind (another site yt-dlp supports: subclass `YouTubeProvider`, override its hoo
 2. **`matches(url)`**: hostname and path regexes, offline, no exceptions. For link kinds you
    cannot download (channels, artists, users) either say False, so the user gets the generic
    "No provider" message (YouTube), or own the host and refuse them in `resolve()` with a
-   sentence saying what to paste instead (Spotify, TikTok), which is friendlier.
+   sentence saying what to paste instead (Spotify, TikTok, SoundCloud), which is friendlier.
 3. **`resolve(url)`**: one `TrackRef` per downloadable track, cheap metadata filled in, silent
    drops for unavailable items, `ProviderError` with a sentence a non-programmer understands
    for everything else. Keep `extra` small and JSON-safe.
@@ -979,7 +1251,15 @@ kind (another site yt-dlp supports: subclass `YouTubeProvider`, override its hoo
    via `destination_for`; emit progress on every status change; check `cancel` and raise
    `DownloadCancelled` after cleaning up; write the `ULTIMATE_PLAYLIST_ID` tag (use
    `youtube.write_tags`); return a `Track` whose `id` equals `ref.track_id`. If the audio comes
-   from another provider, delegate to its `download()` and re-tag, like Spotify does.
+   from another provider, delegate to its `download()` and re-tag, like Spotify does. A
+   `YouTubeProvider` subclass inherits all of that and changes it through the hooks only:
+   `ydl_format` and `ydl_video_format` (the yt-dlp format selectors), `_tags_for(info)` or,
+   when the ref knows more than yt-dlp's info, `_tags_for_ref(ref, info)` (the name and tags),
+   `_source_url(ref, info)` (the link in the comment tag and `Track.source_url`),
+   `_prepare_ydl(ydl)` (called on the `YoutubeDL` before it runs, e.g. to add a
+   post-processor) and `_explain(error)` (the error texts, usually `youtube.explain_error`
+   with the site's rules). It also inherits `supports_video = True`; a site without video sets
+   it to False, as SoundCloud does, or a Video request would ask yt-dlp for a video.
 5. **`doctor()`**: `(ok, label, detail)` triples, never raising, with the fix in `detail`.
    Optional `configure(settings)` if `resolve()` / `doctor()` need live settings.
 6. **Settings**, if the provider needs any: add fields to `Settings` (old config files keep
@@ -1006,8 +1286,8 @@ Windows paths (use `.incoming/` and `safe_filename`, create no other folders or 
 
 ## Testing approach (project-wide)
 
-- Everything is offline. Real YouTube and Spotify are exercised only by a manual integration run
-  (`uv run up add <url>`), never by pytest.
+- Everything is offline. Real YouTube, Spotify, TikTok and SoundCloud are exercised only by a
+  manual integration run (`uv run up add <url>`), never by pytest.
 - Unit tests cover the pure helpers in `providers/youtube.py`, `Settings` and the value rules
   in `config.py`, `find_ffmpeg` (fake `PATH`), `Library`, `PlaylistStore` and `export_m3u8`.
 - `JobManager` flows (single, playlist, skip, cancel, error, retry) run against `FakeProvider`
@@ -1032,6 +1312,23 @@ Windows paths (use `.incoming/` and `safe_filename`, create no other folders or 
   `Artist - Title.mp3`, the `TXXX` frames read `spotify:<id>` and the video id, the Spotify
   cover replaced the YouTube one, and that `DownloadCancelled` propagates; one end-to-end run
   through `JobManager`.
+- SoundCloud (`tests/test_soundcloud_provider.py`): `parse_link` over every link shape and
+  every refusal reason (hosts compared exactly, userinfo, port and backslash tricks, private
+  tokens, the player), with every rebuilt link put to the installed yt-dlp's own SoundCloud
+  extractors (`suitable()`); `pick_tags` on the trimmed info dicts of real tracks plus the rule
+  cases; `friendly_error` on real yt-dlp error texts, whose explanation may never say YouTube
+  or video (yt-dlp's original text appended in brackets may); `resolve()` (the extractor it
+  pins included) and `download()` against a fake `YoutubeDL` and a fake `requests.head`
+  (a HEAD request the test did not set up fails it; a short link is only ever sent to
+  `on.soundcloud.com`); the format selector and `TrimArtworkPP` run through the real yt-dlp's
+  selection and pre-processing on SoundCloud-shaped format and artwork lists (nothing is
+  downloaded); a set and a Video download through `JobManager`; a failed or cancelled download
+  whose fake fragment downloader leaves its `.part` open (in a closure and a reference cycle,
+  as FragmentFD does) with the automatic garbage collector off, after which the file must be
+  closed and the folder gone. `test_youtube_provider.py` checks that the three new hooks
+  change nothing for YouTube; `test_downloader.py` the start-up sweep of `.incoming`.
+- `tests/test_app_js.py` runs functions of `static/app.js` in Node (skipped without Node) with
+  their surroundings stubbed: which job transitions reload the library.
 - Every API endpoint is tested through FastAPI's `TestClient` (`httpx`), including error paths
   (400 for unsupported links, 404 for unknown ids), the `/media/{id}` range request, settings
   validation, the `/api/spotify` routes (login redirect, every callback outcome, the code never

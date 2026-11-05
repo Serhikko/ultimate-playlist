@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -875,3 +877,72 @@ def test_uses_global_registry_with_registered_fake(
         assert fake_provider.downloads == ["global"]
     finally:
         manager.stop()
+
+
+# ----------------------------------------------------------------------------------------------
+# Leftover download folders in <library>/.incoming
+# ----------------------------------------------------------------------------------------------
+
+HOUR = 60 * 60.0
+
+
+def _age(folder: Path, age: float) -> None:
+    """Make `folder` and everything in it look last written `age` seconds ago."""
+    stamp = time.time() - age
+    for path in sorted(folder.rglob("*"), reverse=True):  # children before their folder
+        os.utime(path, (stamp, stamp))
+    os.utime(folder, (stamp, stamp))
+
+
+def _staging(root: Path, name: str, age: float, files: tuple[str, ...] = ("a.part",)) -> Path:
+    """A download folder <root>/.incoming/<name> holding `files`, last written `age` seconds
+    ago."""
+    folder = root / ".incoming" / name
+    folder.mkdir(parents=True)
+    for file in files:
+        (folder / file).parent.mkdir(parents=True, exist_ok=True)
+        (folder / file).write_bytes(b"partial")
+    _age(folder, age)
+    return folder
+
+
+def test_starting_the_queue_sweeps_old_download_folders(
+    tmp_settings: Settings, library: Library
+) -> None:
+    root = tmp_settings.library_dir
+    old_dl = _staging(root, "dl-old12345", 13 * HOUR)
+    # A Spotify download's folder, with the YouTube step's own folder inside.
+    old_sp = _staging(root, "sp-4uLU6hMCjMI-0a1b2c3d", 13 * HOUR, (".incoming/dl-x/1.webm.part",))
+    fresh = _staging(root, "dl-fresh123", 60.0)
+    # Another process may be downloading into this library (`up add` next to the server): one
+    # recent file keeps a folder, however old the rest is.
+    busy = _staging(root, "dl-busy1234", 13 * HOUR, ("old.part", "deep/new.part"))
+    os.utime(busy / "deep" / "new.part")
+    busy_sp = _staging(root, "sp-busy-0a1b2c3d", 13 * HOUR, (".incoming/dl-y/2.webm.part",))
+    os.utime(busy_sp / ".incoming" / "dl-y" / "2.webm.part")
+    other = _staging(root, "keep-me", 13 * HOUR)  # not a download folder
+    stray = root / ".incoming" / "dl-a-file.part"  # a file, not a folder
+    stray.write_bytes(b"x")
+    _age(stray, 13 * HOUR)
+
+    manager = JobManager(tmp_settings, library, providers=FakeRegistry(FakeProvider()))
+    manager.start()
+    manager.stop()
+
+    assert not old_dl.exists() and not old_sp.exists()
+    assert (fresh / "a.part").is_file()
+    assert (busy / "old.part").is_file() and (busy_sp / ".incoming" / "dl-y").is_dir()
+    assert (other / "a.part").is_file() and stray.is_file()
+
+
+def test_sweep_stale_staging_ages(tmp_path: Path) -> None:
+    root = tmp_path / "lib"
+    eleven = _staging(root, "dl-eleven", 11 * HOUR)
+    thirteen = _staging(root, "dl-thirteen", 13 * HOUR)
+    empty = _staging(root, "dl-empty", 13 * HOUR, files=())
+    assert sorted(downloader.sweep_stale_staging(root)) == sorted([empty, thirteen])
+    assert eleven.is_dir() and not thirteen.exists() and not empty.exists()
+    assert downloader.STALE_STAGING_AGE == 12 * HOUR
+    later = time.time() + 2 * HOUR  # an hour past the eleven-hour folder's twelve
+    assert downloader.sweep_stale_staging(root, now=later) == [eleven]
+    assert downloader.sweep_stale_staging(tmp_path / "no-library") == []

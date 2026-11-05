@@ -125,8 +125,8 @@ latter; the zip name and the notices must not say something else).
   a bundle that never imports them.
 - `datas = collect_data_files("ultimate_playlist", includes=["server/static/*"])` puts the web
   UI where `server/app.py` expects it (`Path(__file__).parent / "static"`).
-- Hidden imports: `ultimate_playlist.providers.youtube`, `.spotify` and `.tiktok`, one per
-  built-in provider (the registry imports them with `importlib`, which static analysis cannot
+- Hidden imports: `ultimate_playlist.providers.youtube`, `.spotify`, `.tiktok` and
+  `.soundcloud`, one per built-in provider (the registry imports them with `importlib`, which static analysis cannot
   follow: forget one and the frozen app silently lacks that provider; `test_registry` checks
   the list; the Spotify helper modules `spotify_meta.py` and `ytmusic_match.py` are imported by
   `spotify.py` the normal way and need no entry), plus the uvicorn loop / protocol / lifespan

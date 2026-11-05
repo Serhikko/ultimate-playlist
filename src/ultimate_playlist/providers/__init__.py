@@ -45,6 +45,7 @@ def _load_builtin() -> None:
         ("ultimate_playlist.providers.youtube", "YouTubeProvider"),
         ("ultimate_playlist.providers.spotify", "SpotifyProvider"),
         ("ultimate_playlist.providers.tiktok", "TikTokProvider"),
+        ("ultimate_playlist.providers.soundcloud", "SoundCloudProvider"),
     ]
     import importlib
 

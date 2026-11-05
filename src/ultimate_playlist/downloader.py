@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 import queue
+import shutil
 import threading
 import time
 from collections.abc import Callable
@@ -25,6 +27,11 @@ MAX_WORKERS = 6
 # The video of a track is a library item of its own: "youtube:<id>:video" next to the MP3's
 # "youtube:<id>", so one can be downloaded while the other is in the library.
 VIDEO_ID_SUFFIX = ":video"
+# A download's own folder under <library>/.incoming that nothing was written to for this long is
+# left over (a crash, a hard kill, a file Windows would not let go of) and is swept at start.
+STALE_STAGING_AGE = 12 * 60 * 60.0  # seconds
+# dl-<random>: a yt-dlp download (providers/youtube.py); sp-<id>-<random>: a Spotify one.
+STAGING_PREFIXES = ("dl-", "sp-")
 
 _Queue = queue.Queue[str | None]
 
@@ -57,6 +64,50 @@ def _drop_sentinels(q: _Queue) -> None:
             kept.append(item)
     for item in kept:
         q.put(item)
+
+
+def sweep_stale_staging(
+    library_dir: Path, max_age: float = STALE_STAGING_AGE, now: float | None = None
+) -> list[Path]:
+    """Remove the download folders left in <library>/.incoming: ``dl-*`` and ``sp-*`` folders
+    whose newest file (or folder) was modified more than `max_age` seconds ago. Nothing else
+    there is touched. Another process may be downloading into the same library right now (`up
+    add` next to the server), so the age is what keeps its folders safe: a running download
+    writes all the time. Returns the folders removed."""
+    incoming = Path(library_dir) / ".incoming"
+    cutoff = (time.time() if now is None else now) - max_age
+    removed: list[Path] = []
+    try:
+        with os.scandir(incoming) as scan:
+            entries = [e for e in scan if e.name.startswith(STAGING_PREFIXES)]
+    except OSError:
+        return removed  # no .incoming yet
+    for entry in entries:
+        folder = Path(entry.path)
+        try:
+            if not entry.is_dir(follow_symlinks=False) or _newest_mtime(folder) > cutoff:
+                continue
+        except OSError:
+            continue
+        shutil.rmtree(folder, ignore_errors=True)
+        if not folder.exists():
+            removed.append(folder)
+    if removed:
+        log.info("Removed %d leftover download folder(s) from %s", len(removed), incoming)
+    return removed
+
+
+def _newest_mtime(folder: Path) -> float:
+    """The latest modification time of `folder` and of everything in it (links not followed).
+    OSError when any of it can't be read: such a folder is kept."""
+    newest = folder.lstat().st_mtime
+    unreadable: list[OSError] = []
+    for root, dirs, files in os.walk(folder, onerror=unreadable.append):
+        for name in (*dirs, *files):
+            newest = max(newest, os.lstat(os.path.join(root, name)).st_mtime)
+    if unreadable:
+        raise unreadable[0]
+    return newest
 
 
 def _parent_message(refs: list[TrackRef], count: int) -> str:
@@ -130,6 +181,11 @@ class JobManager:
         return max(1, min(value, MAX_WORKERS))
 
     def start(self) -> None:
+        if not self._running:
+            try:
+                sweep_stale_staging(Path(self.settings.library_dir))
+            except Exception:  # noqa: BLE001 - leftovers are no reason not to start
+                log.exception("Could not sweep %s/.incoming", self.settings.library_dir)
         with self._lock:
             if self._running:
                 return
