@@ -27,11 +27,37 @@ _AUDIO_QUALITY_RE = re.compile(r"^\d{1,3}$")
 CLIENT_ID_MAX_LENGTH = 100
 
 
+# What a download produces (picked next to the Download button, per link): an audio file in
+# `audio_format`, or an MP4 video in one of these qualities.
+MEDIA_KINDS: tuple[str, ...] = ("audio", "video")
+# best: the highest resolution in H.264 (plays on any phone, tablet or TV; usually 1080p).
+# max: the highest resolution up to 4K (often VP9/AV1). 720 / 480: about that resolution (the
+# smallest there is when a site has nothing that small), H.264.
+VIDEO_QUALITIES: tuple[str, ...] = ("best", "max", "720", "480")
+DEFAULT_VIDEO_QUALITY = "best"
+
+
 def clean_audio_format(value: str) -> str:
     fmt = (value or "").strip().lower()
     if fmt not in AUDIO_FORMATS:
         raise ValueError(f"Audio format must be one of: {', '.join(AUDIO_FORMATS)}.")
     return fmt
+
+
+def clean_media(value: str | None) -> str:
+    """ "audio" (the default for a missing value) or "video"."""
+    media = (value or "audio").strip().lower()
+    if media not in MEDIA_KINDS:
+        raise ValueError("Download as audio or video.")
+    return media
+
+
+def clean_video_quality(value: str | None) -> str:
+    """A key of VIDEO_QUALITIES ("720p" / "720P" are read as "720"; empty = the default)."""
+    quality = (value or DEFAULT_VIDEO_QUALITY).strip().lower().removesuffix("p")
+    if quality not in VIDEO_QUALITIES:
+        raise ValueError(f"Video quality must be one of: {', '.join(VIDEO_QUALITIES)}.")
+    return quality
 
 
 def clean_audio_quality(value: str) -> str:

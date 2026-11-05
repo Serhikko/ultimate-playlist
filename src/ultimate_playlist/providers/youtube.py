@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import shutil
+import tempfile
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -31,7 +32,7 @@ from mutagen.oggopus import OggOpus
 from mutagen.oggvorbis import OggVorbis
 
 from ..bundled import bundled_tool, is_bundled, is_frozen
-from ..config import Settings
+from ..config import DEFAULT_VIDEO_QUALITY, Settings, clean_video_quality
 from ..ffmpeg import find_ffmpeg, install_hint, missing_bundled_hint, resolve_explicit
 from ..library import read_tags
 from ..models import JobStatus, ProgressEvent, Track, TrackRef
@@ -325,7 +326,7 @@ CONVERSION_ERRORS: tuple[str, ...] = (
     "audio conversion",
 )
 CONVERSION_FAILED = (
-    "Converting the audio failed. Check that ffmpeg is installed (see the doctor page)."
+    "Converting the download failed. Check that ffmpeg is installed (see the doctor page)."
 )
 
 ErrorRules = tuple[tuple[tuple[str, ...], str], ...]
@@ -378,7 +379,7 @@ _FRIENDLY_RULES: ErrorRules = (
     ),
     (
         ("requested format is not available", "no video formats found"),
-        "YouTube didn't offer a downloadable audio stream for this video (try updating yt-dlp).",
+        "YouTube didn't offer a downloadable stream for this video (try updating yt-dlp).",
     ),
     (
         ("only images are available",),
@@ -457,7 +458,7 @@ def _http_status_message(code: int) -> str | None:
     is the classic stale-signature / out-of-date-yt-dlp failure, not a connectivity problem."""
     if code == 403:
         return (
-            "YouTube refused to serve the audio. This usually means yt-dlp is out of date; "
+            "YouTube refused to serve the download. This usually means yt-dlp is out of date; "
             "update it (uv lock --upgrade-package yt-dlp && uv sync) and try again."
         )
     if code == 429:
@@ -597,21 +598,45 @@ def _float_or_none(value: Any) -> float | None:
         return None
 
 
+# yt-dlp's format sorting (``-S``) per video quality (config.VIDEO_QUALITIES). "vcodec:h264"
+# ranks H.264 above the newer codecs (VP9, AV1, H.265), which not every phone, TV or browser
+# plays; "res:720" prefers the largest resolution up to 720p (a preference, not a cap: with
+# nothing that small, the smallest larger one); "acodec:aac" keeps the audio in AAC, which an
+# MP4 holds everywhere. "max" asks for resolution (up to 4K, never 8K) and frame rate only.
+VIDEO_FORMAT_SORT: dict[str, list[str]] = {
+    "best": ["vcodec:h264", "res", "acodec:aac"],
+    "max": ["res:2160", "fps"],
+    "720": ["res:720", "vcodec:h264", "acodec:aac"],
+    "480": ["res:480", "vcodec:h264", "acodec:aac"],
+}
+VIDEO_CONTAINER = "mp4"
+
+
 def _ydl_opts(
     settings: Settings,
     incoming_dir: Path,
     progress: ProgressCallback,
     cancel: threading.Event,
     format_selector: str = "bestaudio/best",
+    video_quality: str | None = None,
 ) -> dict[str, Any]:
-    """Build the YoutubeDL option dict for one download (kept separate so tests can inspect it)."""
-    fmt = settings.audio_format
-    converting_msg = f"Converting to {fmt.upper()}"
+    """Build the YoutubeDL option dict for one download (kept separate so tests can inspect it).
+
+    With `video_quality` (a VIDEO_FORMAT_SORT key) the download is an MP4 video: the streams
+    are merged (or the single file remuxed) into MP4 instead of being converted to audio.
+    """
+    video = video_quality is not None
+    fmt = VIDEO_CONTAINER if video else settings.audio_format
+    converting_msg = "Saving as MP4" if video else f"Converting to {fmt.upper()}"
     # yt-dlp reports `PostProcessor.pp_key()` ("ExtractAudio", "Metadata", "MoveFiles"): the
     # class name minus the "FFmpeg" prefix and "PP" suffix. Accept the option keys too.
     pp_messages = {
         "ExtractAudio": converting_msg,
         "FFmpegExtractAudio": converting_msg,
+        "Merger": "Merging video and audio",
+        "FFmpegMerger": "Merging video and audio",
+        "VideoRemuxer": converting_msg,
+        "FFmpegVideoRemuxer": converting_msg,
         "Metadata": "Writing tags",
         "FFmpegMetadata": "Writing tags",
         "EmbedThumbnail": "Embedding cover art",
@@ -630,12 +655,21 @@ def _ydl_opts(
                 d.get("total_bytes_estimate")
             )
             fraction = max(0.0, min(1.0, done / total)) if done is not None and total else None
+            # A video comes as two streams, one after the other: name the one downloading, or
+            # the second would show the first's "Saving as MP4" while its bar starts over.
+            message = None
+            if video:
+                stream = d.get("info_dict") if isinstance(d.get("info_dict"), dict) else {}
+                message = (
+                    "Downloading audio" if stream.get("vcodec") == "none" else "Downloading video"
+                )
             progress(
                 ProgressEvent(
                     JobStatus.DOWNLOADING,
                     progress=fraction,
                     speed=_float_or_none(d.get("speed")),
                     eta=_float_or_none(d.get("eta")),
+                    message=message,
                 )
             )
         elif status == "finished":
@@ -655,7 +689,10 @@ def _ydl_opts(
             progress(ProgressEvent(JobStatus.CONVERTING, progress=1.0, message=message))
 
     postprocessors: list[dict[str, Any]] = [
-        {
+        # A video in one file (no separate audio to merge) that is not MP4 already becomes one.
+        {"key": "FFmpegVideoRemuxer", "preferedformat": VIDEO_CONTAINER}
+        if video
+        else {
             "key": "FFmpegExtractAudio",
             "preferredcodec": fmt,
             "preferredquality": settings.audio_quality,
@@ -684,10 +721,25 @@ def _ydl_opts(
         "progress_hooks": [hook],
         "postprocessor_hooks": [pp_hook],
     }
+    if video:
+        opts["format_sort"] = list(VIDEO_FORMAT_SORT[video_quality or "best"])
+        opts["merge_output_format"] = VIDEO_CONTAINER
     location = _ffmpeg_location(settings)
     if location:
         opts["ffmpeg_location"] = location
     return opts
+
+
+def _video_quality_of(ref: TrackRef) -> str | None:
+    """The VIDEO_FORMAT_SORT key when the downloader asked for the video (ref.extra["media"]),
+    else None (an audio download). An unknown quality falls back to the default."""
+    extra = ref.extra if isinstance(ref.extra, dict) else {}
+    if extra.get("media") != "video":
+        return None
+    try:
+        return clean_video_quality(str(extra.get("quality") or ""))
+    except ValueError:
+        return DEFAULT_VIDEO_QUALITY
 
 
 def _thumbnail_of(info: dict[str, Any]) -> str | None:
@@ -759,22 +811,9 @@ def _produced_file(incoming: Path, video_id: str, fmt: str, info: dict[str, Any]
     if filepath and Path(filepath).is_file():
         return Path(filepath)
     raise ProviderError(
-        "The converted audio file was not produced. Check that ffmpeg is installed "
+        "The finished file was not produced. Check that ffmpeg is installed "
         "(run the doctor) and try again."
     )
-
-
-def _cleanup_incoming(incoming: Path, video_id: str) -> None:
-    """Remove `.incoming/<id>.*` leftovers (thumbnails, .part, .ytdl, originals)."""
-    if not video_id or not incoming.is_dir():
-        return
-    prefix = f"{video_id}."
-    for path in incoming.iterdir():
-        if path.name.startswith(prefix) and path.is_file():
-            try:
-                path.unlink()
-            except OSError as exc:
-                log.debug("Could not remove leftover %s: %s", path, exc)
 
 
 def _fill_id3(
@@ -994,6 +1033,10 @@ class YouTubeProvider:
     display_name = "YouTube"
     # What download() asks yt-dlp for; a subclass whose site has no audio-only stream overrides it.
     ydl_format = "bestaudio/best"
+    # A video download (ref.extra["media"] == "video", set by the downloader): the best video
+    # stream and the best audio stream, merged; else the best file that has both.
+    supports_video = True
+    ydl_video_format = "bv*+ba/b"
 
     def __init__(self, settings: Settings | None = None) -> None:
         self._settings = settings
@@ -1098,11 +1141,21 @@ class YouTubeProvider:
     ) -> Track:
         dest_dir = Path(dest_dir)
         dest_dir.mkdir(parents=True, exist_ok=True)
-        incoming = dest_dir / ".incoming"
-        incoming.mkdir(parents=True, exist_ok=True)
-        fmt = settings.audio_format
+        # Each download works in a folder of its own under .incoming, removed whatever happens:
+        # the MP3 and the MP4 of one video (two library items) may download at the same time,
+        # and yt-dlp names its files after the video id alone.
+        (dest_dir / ".incoming").mkdir(parents=True, exist_ok=True)
+        incoming = Path(tempfile.mkdtemp(prefix="dl-", dir=dest_dir / ".incoming"))
+        video_quality = _video_quality_of(ref)
+        if video_quality is None:
+            fmt = settings.audio_format
+            opts = _ydl_opts(settings, incoming, progress, cancel, self.ydl_format)
+        else:
+            fmt = VIDEO_CONTAINER
+            opts = _ydl_opts(
+                settings, incoming, progress, cancel, self.ydl_video_format, video_quality
+            )
         video_id = ref.source_id
-        opts = _ydl_opts(settings, incoming, progress, cancel, self.ydl_format)
         logger: _YdlLogger = opts["logger"]
         try:
             if cancel.is_set():
@@ -1168,9 +1221,7 @@ class YouTubeProvider:
             log.exception("Unexpected failure downloading %s", ref.url)
             raise ProviderError(f"Download failed: {exc}") from exc
         finally:
-            _cleanup_incoming(incoming, ref.source_id)
-            if video_id != ref.source_id:
-                _cleanup_incoming(incoming, video_id)
+            shutil.rmtree(incoming, ignore_errors=True)  # streams, .part files, thumbnails
 
     # -- diagnostics ---------------------------------------------------------------------------
 

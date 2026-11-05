@@ -429,7 +429,7 @@ def test_pick_artist_title_keeps_raw_title_when_cleaning_empties_it() -> None:
         ),
         (
             "ERROR: Postprocessing: ffprobe and ffmpeg not found. Please install or provide the path",
-            "Converting the audio failed",
+            "Converting the download failed",
         ),
         ("ERROR: Unsupported URL: https://example.com", "This link isn't a YouTube video"),
         ("ERROR: something nobody expected", "YouTube download failed."),
@@ -437,7 +437,7 @@ def test_pick_artist_title_keeps_raw_title_when_cleaning_empties_it() -> None:
         # HTTP statuses during the media download are not connectivity problems
         (
             "ERROR: unable to download video data: HTTP Error 403: Forbidden",
-            "YouTube refused to serve the audio",
+            "YouTube refused to serve the download",
         ),
         (
             "ERROR: [youtube] abc: Unable to download API page: HTTP Error 429: Too Many Requests",
@@ -459,7 +459,7 @@ def test_pick_artist_title_keeps_raw_title_when_cleaning_empties_it() -> None:
         # narrowed needles: format / playlist / member-tier / typo'd id messages
         (
             "ERROR: [youtube] abc: Requested format is not available. Use --list-formats for a list of available formats",
-            "YouTube didn't offer a downloadable audio stream",
+            "YouTube didn't offer a downloadable stream",
         ),
         ("ERROR: [youtube] abc: No video formats found!", "YouTube didn't offer"),
         ("ERROR: [youtube:tab] PL123: The playlist does not exist.", "That playlist doesn't exist"),
@@ -1081,7 +1081,9 @@ def test_download_success(fake_ydl: type[FakeYoutubeDL], tmp_path: Path) -> None
 
     (ydl,) = fake_ydl.instances
     assert ydl.calls == [("https://www.youtube.com/watch?v=jNQXAC9IVRw", True)]
-    assert ydl.opts["outtmpl"] == str(incoming / "%(id)s.%(ext)s")
+    outtmpl = Path(ydl.opts["outtmpl"])
+    assert outtmpl.name == "%(id)s.%(ext)s"
+    assert outtmpl.parent.parent == incoming and outtmpl.parent.name.startswith("dl-")
 
 
 @pytest.mark.parametrize("fmt", OTHER_FORMATS)
@@ -1377,8 +1379,8 @@ def test_download_cancelled_via_hook_cleans_up(
     incoming = settings.library_dir / ".incoming"
 
     def on_extract(ydl: FakeYoutubeDL, url: str) -> None:
-        incoming.mkdir(parents=True, exist_ok=True)
-        (incoming / "jNQXAC9IVRw.webm.part").write_bytes(b"partial")
+        staging = Path(ydl.opts["outtmpl"]).parent  # this download's own folder in .incoming
+        (staging / "jNQXAC9IVRw.webm.part").write_bytes(b"partial")
         cancel.set()  # the user clicked Cancel mid-download
         ydl.opts["progress_hooks"][0]({"status": "downloading", "downloaded_bytes": 1})
 
@@ -1395,9 +1397,10 @@ def test_download_error_becomes_friendly_and_cleans_up(
     incoming = settings.library_dir / ".incoming"
 
     def on_extract(ydl: FakeYoutubeDL, url: str) -> None:
-        (incoming / "jNQXAC9IVRw.webm.part").write_bytes(b"partial")
-        (incoming / "jNQXAC9IVRw.webp").write_bytes(b"thumb")
-        (incoming / "unrelated.mp3").write_bytes(b"keep me")
+        staging = Path(ydl.opts["outtmpl"]).parent
+        (staging / "jNQXAC9IVRw.webm.part").write_bytes(b"partial")
+        (staging / "jNQXAC9IVRw.webp").write_bytes(b"thumb")
+        (incoming / "unrelated.mp3").write_bytes(b"keep me")  # another download's file
         raise yt_dlp.utils.DownloadError("ERROR: [youtube] jNQXAC9IVRw: Video unavailable")
 
     fake_ydl.on_extract = on_extract

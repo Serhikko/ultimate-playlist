@@ -731,6 +731,9 @@ def test_snapshot_shape(make_jobs) -> None:
         "track",
         "created_at",
         "updated_at",
+        "media",
+        "quality",
+        "folder",
     }
     assert entry["status"] == "done"
     assert entry["title"] == "Fake Artist - Track snap"

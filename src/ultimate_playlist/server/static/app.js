@@ -377,7 +377,36 @@
     exportPaths: new Map(), // playlist id -> last exported path
     selection: new Set(),
     tab: 'library',
+    folders: [], // [{ name, count }] from /api/folders (empty folders included)
+    unsortedCount: 0,
+    folder: null, // the library view: null = all tracks, '' = Unsorted, else a folder name
+    dl: { media: 'audio', quality: 'best', folder: '' }, // the options next to Download
   };
+
+  const DL_PREFS_KEY = 'ultimate-playlist.download';
+  const QUALITY_LABEL = { best: 'Best', max: 'Maximum', 720: '720p', 480: '480p' };
+  const TRACKS_DRAG_TYPE = 'application/x-ultimate-playlist-tracks';
+  const NEW_FOLDER_VALUE = '\u0000new-folder';
+  const VIDEO_PATH_RE = /\.(mp4|m4v|webm|mkv|mov)$/i;
+
+  /** The rows the Library tab shows: the loaded tracks (search applied), narrowed to the folder. */
+  function libraryTracks() {
+    if (state.folder === null) return state.tracks;
+    return state.tracks.filter((t) => (t.folder || '') === state.folder);
+  }
+
+  /** What the player calls the list it plays from the Library tab. */
+  function libraryLabel() {
+    if (state.query) return 'Search results';
+    if (state.folder === null) return 'Library';
+    return state.folder || 'Unsorted';
+  }
+
+  function isVideo(track) {
+    if (!track) return false;
+    const known = state.trackIndex.get(track.id) || track;
+    return known.media === 'video' || VIDEO_PATH_RE.test(String(known.path || ''));
+  }
 
   // ================================================================ Status chips
 
@@ -675,8 +704,9 @@
 
     async function downloadLikedSongs() {
       try {
-        await api('/api/jobs', { method: 'POST', body: { url: SPOTIFY_LIKED_SONGS_URL } });
-        toast('Your Liked Songs were added to the queue', 'success');
+        const folder = state.dl.folder; // Save to applies here too (Spotify songs are audio)
+        await api('/api/jobs', { method: 'POST', body: { url: SPOTIFY_LIKED_SONGS_URL, folder } });
+        toast(`Your Liked Songs were added to the queue${folder ? ` (into ${folder})` : ''}`, 'success');
         dialogEl.close(); // show the queue; nothing typed in the dialog is saved
         pollJobs();
       } catch (err) {
@@ -877,6 +907,9 @@
       kids ? kids.map((k) => k.status) : null,
       playingId(),
       audio.paused,
+      job.media,
+      job.quality,
+      job.folder,
     ]);
   }
 
@@ -970,6 +1003,13 @@
         el('span', { class: `pill pill-${status}${live ? ' pill-live' : ''}`, text: STATUS_LABEL[status] || status }),
       ),
     );
+    if (!isChild) {
+      // What the link becomes and where it lands; a playlist's rows repeat their parent's.
+      const tags = [];
+      if (job.media === 'video') tags.push(`Video · ${QUALITY_LABEL[job.quality] || 'Best'}`);
+      if (job.folder) tags.push(`→ ${job.folder}`);
+      if (tags.length) row.append(el('div', { class: 'job-tags', text: tags.join('  ') }));
+    }
 
     const isParent = Number(job.child_count) > 0;
     if (isParent) {
@@ -1024,11 +1064,14 @@
     }
     button.disabled = true;
     try {
-      const data = await api('/api/jobs', { method: 'POST', body: { url: text } });
+      const { media, quality, folder } = state.dl;
+      const body = { url: text, media, quality: media === 'video' ? quality : '', folder };
+      const data = await api('/api/jobs', { method: 'POST', body });
       const count = Array.isArray(data && data.jobs) ? data.jobs.length : 1;
       input.value = '';
       autosize(input);
-      toast(count === 1 ? 'Added to the queue' : `Added ${count} links to the queue`, 'success');
+      const where = folder ? ` (into ${folder})` : '';
+      toast(count === 1 ? `Added to the queue${where}` : `Added ${count} links to the queue${where}`, 'success');
       pollJobs();
     } catch (err) {
       showError(err);
@@ -1081,6 +1124,11 @@
     for (const id of [...state.selection]) if (!state.trackIndex.has(id)) state.selection.delete(id);
     refreshTrackCount();
     renderQueue(); // Play buttons in the queue follow what is actually in the library
+    // The All tracks count: only the number, so a folder item keeps keyboard focus. (Found
+    // by dataset, not a selector: CSS reads the NUL in its key as U+FFFD.)
+    const all = [...document.querySelectorAll('#folder-list .folder-item')].find((li) => li.dataset.folder === '\u0000all');
+    const count = all && all.querySelector('.folder-count');
+    if (count) count.textContent = String(state.trackIndex.size);
   }
 
   async function loadLibrary() {
@@ -1097,6 +1145,7 @@
     } catch (err) {
       showError(err);
     }
+    loadFolders(); // counts follow downloads, moves and rescans
   }
 
   /** Refresh the visible rows and, when a search filter is active, the unfiltered index too. */
@@ -1157,12 +1206,15 @@
     const host = $('#library-list');
     const top = host.scrollTop; // a refresh (e.g. a download landing) must not jump to the top
     clearCovers(host);
-    const tracks = state.tracks;
+    const tracks = libraryTracks();
     $('#library-count').textContent = tracks.length ? plural(tracks.length, 'track') : '';
     updateSelectionBar();
     updatePlayButton(); // the big Play button starts the library once there is something to play
     if (!tracks.length) {
-      host.append(emptyState(state.query ? 'No tracks match your search' : 'Your library is empty. Downloaded tracks will show up here.', 'music'));
+      let text = 'Your library is empty. Downloaded tracks will show up here.';
+      if (state.query) text = 'No tracks match your search';
+      else if (state.folder !== null) text = `${state.folder || 'Unsorted'} is empty. Drag tracks here, or pick it next to the Download button.`;
+      host.append(emptyState(text, state.folder !== null ? 'folder' : 'music'));
       return;
     }
     const selectAll = el('input', {
@@ -1198,7 +1250,7 @@
   }
 
   function syncSelectAll(selectAll) {
-    const tracks = state.tracks;
+    const tracks = libraryTracks();
     const selected = tracks.filter((t) => state.selection.has(t.id)).length;
     selectAll.checked = tracks.length > 0 && selected === tracks.length;
     selectAll.indeterminate = selected > 0 && selected < tracks.length;
@@ -1218,22 +1270,36 @@
         syncSelectAll(selectAll);
       },
     });
+    const play = () => playTracks(libraryTracks(), index, libraryLabel());
+    // In "All" the folder is named on the row; inside a folder that would only repeat it.
+    const folderTag = state.folder === null && track.folder ? el('span', { class: 'folder-tag', text: track.folder, title: `In the folder ${track.folder}` }) : null;
+    const mediaTag = isVideo(track) ? el('span', { class: 'media-tag', text: 'MP4', title: 'Video' }) : null;
     const row = el(
       'tr',
       {
         class: `track-row${selected ? ' selected' : ''}${playingId() === track.id ? ' playing' : ''}`,
         dataset: { id: track.id },
+        draggable: 'true',
         onclick: (event) => {
           if (event.target.closest('button, input, a, label')) return;
-          playTracks(state.tracks, index, state.query ? 'Search results' : 'Library');
+          play();
         },
+        ondragstart: (event) => {
+          // A selected row drags the whole selection; any other row just itself.
+          const ids = state.selection.has(track.id) ? [...state.selection] : [track.id];
+          event.dataTransfer.setData(TRACKS_DRAG_TYPE, JSON.stringify(ids));
+          event.dataTransfer.setData('text/plain', ids.length === 1 ? trackLabel(track) : `${ids.length} tracks`);
+          event.dataTransfer.effectAllowed = 'move';
+          row.classList.add('dragging');
+        },
+        ondragend: () => row.classList.remove('dragging'),
       },
       el('td', { class: 'col-check' }, check),
       el('td', { class: 'col-cover' }, coverThumb(track)),
       el(
         'td',
         { class: 'col-title' },
-        el('div', { class: 'cell-title', text: track.title || 'Untitled' }),
+        el('div', { class: 'cell-title' }, el('span', { text: track.title || 'Untitled' }), mediaTag, folderTag),
         track.album ? el('div', { class: 'cell-sub muted', text: track.album }) : null,
       ),
       el('td', { class: 'col-artist', text: track.artist || 'Unknown artist' }),
@@ -1245,7 +1311,8 @@
         el(
           'div',
           { class: 'row-actions' },
-          iconButton('play', 'Play', () => playTracks(state.tracks, index, state.query ? 'Search results' : 'Library')),
+          iconButton('play', 'Play', play),
+          iconButton('folder-move', 'Move to folder', (event) => openMoveMenu(event.currentTarget, [track.id])),
           iconButton('plus', 'Add to playlist', (event) => openAddToPlaylistMenu(event.currentTarget, [track.id])),
           iconButton('trash', 'Delete', () => deleteTrack(track), { danger: true }),
         ),
@@ -1267,12 +1334,287 @@
     renderLibrary();
   }
 
+  // ================================================================ Folders
+
+  /** Folders are real directories in the library folder; '' is Unsorted (the folder itself). */
+  async function loadFolders() {
+    try {
+      applyFolders(await api('/api/folders'));
+    } catch (err) {
+      showError(err);
+    }
+  }
+
+  function applyFolders(data) {
+    if (!data || !Array.isArray(data.folders)) return;
+    state.folders = data.folders.filter((f) => f && typeof f.name === 'string');
+    state.unsortedCount = Number(data.unsorted) || 0;
+    const names = new Set(state.folders.map((f) => f.name));
+    if (state.folder && !names.has(state.folder)) selectFolder(null); // renamed or removed elsewhere
+    if (state.dl.folder && !names.has(state.dl.folder)) setSaveFolder('');
+    renderFolders();
+    renderSaveFolderSelect();
+  }
+
+  function folderLabel(name) {
+    return name === null ? 'All tracks' : name || 'Unsorted';
+  }
+
+  function selectFolder(name) {
+    if (state.folder === name) return;
+    state.folder = name;
+    state.selection.clear(); // a selection the new view hides would be moved or added unseen
+    renderFolders();
+    renderLibrary();
+  }
+
+  function renderFolders() {
+    const list = $('#folder-list');
+    clear(list);
+    const total = state.trackIndex.size;
+    list.append(folderItem(null, total, 'music'));
+    list.append(folderItem('', state.unsortedCount, 'inbox'));
+    if (state.folders.length) list.append(el('li', { class: 'folder-sep', role: 'separator' }));
+    for (const folder of state.folders) list.append(folderItem(folder.name, folder.count, 'folder'));
+  }
+
+  function focusFolderItem(name) {
+    const items = [...document.querySelectorAll('#folder-list .folder-item')];
+    const target = items.find((li) => li.dataset.folder === (name === null ? '\u0000all' : name));
+    if (target) target.focus();
+  }
+
+  function folderItem(name, count, iconName) {
+    const isFolder = typeof name === 'string' && name !== '';
+    const item = el(
+      'li',
+      {
+        class: `folder-item${state.folder === name ? ' active' : ''}`,
+        tabindex: '0',
+        dataset: { folder: name === null ? '\u0000all' : name },
+        title: name === null ? 'Everything in the library' : name === '' ? 'Tracks in no folder' : name,
+        onclick: (event) => {
+          if (event.target.closest('button')) return;
+          selectFolder(name);
+        },
+        onkeydown: (event) => {
+          if (event.target !== item) return; // Enter / Space on Rename or Remove is theirs
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            selectFolder(name);
+            focusFolderItem(name); // the rail was rebuilt: keep the keyboard where it was
+          }
+        },
+      },
+      icon(iconName),
+      el('span', { class: 'folder-name', text: folderLabel(name) }),
+      isFolder ? iconButton('edit', 'Rename folder', () => renameFolder(name)) : null,
+      isFolder ? iconButton('trash', 'Remove folder (its tracks go back to Unsorted)', () => deleteFolder(name), { danger: true }) : null,
+      el('span', { class: 'folder-count', text: String(Number(count) || 0) }),
+    );
+    if (name !== null) attachFolderDrop(item, name); // "All tracks" is a view, not a place
+    return item;
+  }
+
+  function draggedTrackIds(event) {
+    try {
+      const ids = JSON.parse(event.dataTransfer.getData(TRACKS_DRAG_TYPE) || '[]');
+      return Array.isArray(ids) ? ids.filter((id) => typeof id === 'string') : [];
+    } catch (_err) {
+      return [];
+    }
+  }
+
+  function attachFolderDrop(item, name) {
+    const accepts = (event) => event.dataTransfer && Array.from(event.dataTransfer.types || []).includes(TRACKS_DRAG_TYPE);
+    item.addEventListener('dragover', (event) => {
+      if (!accepts(event)) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'move';
+      item.classList.add('drop-target');
+    });
+    item.addEventListener('dragleave', () => item.classList.remove('drop-target'));
+    item.addEventListener('drop', (event) => {
+      item.classList.remove('drop-target');
+      if (!accepts(event)) return;
+      event.preventDefault();
+      const ids = draggedTrackIds(event);
+      if (ids.length) moveTracks(ids, name);
+    });
+  }
+
+  /** Ask for a folder name and create the folder; resolves to its name, or null. */
+  async function createFolder() {
+    const name = await promptDialog({ title: 'New folder', label: 'Folder name', placeholder: 'Flight', confirmLabel: 'Create' });
+    if (name === null || !name.trim()) return null;
+    try {
+      const data = await api('/api/folders', { method: 'POST', body: { name: name.trim() } });
+      applyFolders(data);
+      toast(`Folder “${data.name}” is ready`, 'success');
+      return data.name;
+    } catch (err) {
+      showError(err);
+      return null;
+    }
+  }
+
+  async function renameFolder(name) {
+    const next = await promptDialog({ title: 'Rename folder', label: 'Folder name', value: name, confirmLabel: 'Rename' });
+    if (next === null || !next.trim() || next.trim() === name) return;
+    try {
+      const data = await api(`/api/folders/${encodeURIComponent(name)}`, { method: 'PATCH', body: { name: next.trim() } });
+      if (state.folder === name) state.folder = data.name;
+      if (state.dl.folder === name) setSaveFolder(data.name);
+      applyFolders(data);
+      await reloadTracks();
+    } catch (err) {
+      showError(err);
+    }
+  }
+
+  async function deleteFolder(name) {
+    const folder = state.folders.find((f) => f.name === name);
+    const count = folder ? Number(folder.count) || 0 : 0;
+    const { ok } = await confirmDialog({
+      title: 'Remove folder',
+      message: count
+        ? `Remove the folder “${name}”? Its ${plural(count, 'track')} go back to Unsorted; nothing is deleted.`
+        : `Remove the empty folder “${name}”?`,
+      confirmLabel: 'Remove folder',
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      const data = await api(`/api/folders/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      if (!reportMoveFailures(data) && data.note) toast(data.note, 'info', 8000);
+      applyFolders(data);
+      await reloadTracks();
+    } catch (err) {
+      showError(err);
+    }
+  }
+
+  /** Move tracks' files into a folder ('' = Unsorted). Tracks that can't move keep their place. */
+  async function moveTracks(ids, folder) {
+    if (!ids.length) return;
+    try {
+      const data = await api('/api/library/move', { method: 'POST', body: { track_ids: ids, folder } });
+      const moved = Array.isArray(data.moved) ? data.moved.length : 0;
+      if (!reportMoveFailures(data)) toast(`Moved ${plural(moved, 'track')} to ${folder || 'Unsorted'}`, 'success');
+      for (const id of data.moved || []) state.selection.delete(id);
+      applyFolders(data);
+      await reloadTracks();
+    } catch (err) {
+      showError(err);
+    }
+  }
+
+  /** Toast what could not be moved; true when something failed. */
+  function reportMoveFailures(data) {
+    const failed = Array.isArray(data && data.failed) ? data.failed : [];
+    if (!failed.length) return false;
+    const first = failed[0];
+    const more = failed.length > 1 ? ` (and ${failed.length - 1} more)` : '';
+    toast(`${first.error || 'A track could not be moved'}${more}`);
+    return true;
+  }
+
+  function openMoveMenu(anchor, ids) {
+    if (!ids.length) return;
+    const items = [{ label: 'Unsorted', icon: 'inbox', onClick: () => moveTracks(ids, '') }];
+    if (state.folders.length) items.push('sep');
+    for (const folder of state.folders) items.push({ label: folder.name, icon: 'folder', onClick: () => moveTracks(ids, folder.name) });
+    items.push('sep', {
+      label: 'New folder…',
+      icon: 'plus',
+      onClick: async () => {
+        const name = await createFolder();
+        if (name) moveTracks(ids, name);
+      },
+    });
+    openMenu(anchor, items);
+  }
+
+  // ================================================================ Download options
+
+  function loadDownloadPrefs() {
+    let prefs = null;
+    try {
+      prefs = JSON.parse(localStorage.getItem(DL_PREFS_KEY) || 'null');
+    } catch (_err) {
+      prefs = null;
+    }
+    if (prefs && typeof prefs === 'object') {
+      if (prefs.media === 'audio' || prefs.media === 'video') state.dl.media = prefs.media;
+      if (['best', 'max', '720', '480'].includes(prefs.quality)) state.dl.quality = prefs.quality;
+      if (typeof prefs.folder === 'string') state.dl.folder = prefs.folder;
+    }
+  }
+
+  function saveDownloadPrefs() {
+    try {
+      localStorage.setItem(DL_PREFS_KEY, JSON.stringify(state.dl));
+    } catch (_err) {
+      /* storage may be unavailable; the choice then lasts until the page reloads */
+    }
+  }
+
+  function setMedia(media) {
+    state.dl.media = media === 'video' ? 'video' : 'audio';
+    for (const [id, value] of [['#media-audio', 'audio'], ['#media-video', 'video']]) {
+      const button = $(id);
+      const on = state.dl.media === value;
+      button.classList.toggle('active', on);
+      button.setAttribute('aria-checked', String(on));
+    }
+    $('#quality').hidden = state.dl.media !== 'video';
+    saveDownloadPrefs();
+  }
+
+  function setSaveFolder(name) {
+    state.dl.folder = name || '';
+    saveDownloadPrefs();
+    renderSaveFolderSelect();
+  }
+
+  function renderSaveFolderSelect() {
+    const select = $('#save-folder');
+    clear(select);
+    select.append(el('option', { value: '', text: 'Save to: Unsorted' }));
+    for (const folder of state.folders) select.append(el('option', { value: folder.name, text: `Save to: ${folder.name}` }));
+    select.append(el('option', { value: NEW_FOLDER_VALUE, text: 'New folder…' }));
+    select.value = state.folders.some((f) => f.name === state.dl.folder) ? state.dl.folder : '';
+  }
+
+  function initDownloadOptions() {
+    loadDownloadPrefs();
+    $('#quality').value = state.dl.quality;
+    setMedia(state.dl.media);
+    renderSaveFolderSelect();
+    $('#media-audio').addEventListener('click', () => setMedia('audio'));
+    $('#media-video').addEventListener('click', () => setMedia('video'));
+    $('#quality').addEventListener('change', (event) => {
+      state.dl.quality = event.target.value;
+      saveDownloadPrefs();
+    });
+    $('#save-folder').addEventListener('change', async (event) => {
+      const value = event.target.value;
+      if (value !== NEW_FOLDER_VALUE) {
+        setSaveFolder(value);
+        return;
+      }
+      renderSaveFolderSelect(); // back to the current choice while the dialog is open
+      const name = await createFolder();
+      if (name) setSaveFolder(name);
+    });
+  }
+
   async function deleteTrack(track) {
     const { ok, checked } = await confirmDialog({
       title: 'Remove from library',
       message: `Remove “${trackLabel(track)}” from the library?`,
       confirmLabel: 'Remove',
-      checkbox: 'Also delete the audio file from disk',
+      checkbox: 'Also delete the file from disk',
       danger: true,
     });
     if (!ok) return;
@@ -1403,7 +1745,8 @@
         finish(false);
       }
     });
-    input.addEventListener('blur', () => finish(true));
+    // A blur because the video panel made the page behind it inert is not "done typing".
+    input.addEventListener('blur', () => finish(!input.closest('[inert]')));
     input.addEventListener('click', (event) => event.stopPropagation());
     nameEl.replaceWith(input);
     input.focus();
@@ -1733,9 +2076,56 @@
     seeking: false,
     lastVolume: 1,
     errorStreak: 0, // consecutive tracks that failed to play; stops auto-skip from looping forever
+    videoHidden: false, // the user closed the video panel; the video keeps playing (as audio)
+    videoAutoHidden: false, // hidden only because the user was typing when the video came up
   };
 
   const playingId = () => (player.current ? player.current.id : null);
+
+  /** The video panel covers the library while a video plays (unless hidden); the media element
+   *  lives in it, so audio plays from the same element with the panel closed. */
+  function updateVideoPanel() {
+    const video = player.current && isVideo(player.current);
+    const panel = $('#video-panel');
+    if (video && !player.videoHidden && panel.hidden && typingBehindPanel()) {
+      // The queue moved on to a video while the user types a search or a playlist name: the
+      // panel would take the field's focus and the next keys would run shortcuts. The video
+      // plays on behind the video button in the player bar instead, for this track only
+      // (playAtPos asks again at the next one; the user's own × stays until a new list).
+      player.videoHidden = true;
+      player.videoAutoHidden = true;
+    }
+    panel.hidden = !video || player.videoHidden;
+    $('#btn-video').hidden = !video || !player.videoHidden;
+    // The panel covers the tabs and the library: keep Tab and screen readers out of them.
+    for (const node of document.querySelectorAll('.content > .tabs, .content > .tab-pane')) node.inert = !panel.hidden;
+    $('#video-title').textContent = video ? trackLabel(state.trackIndex.get(player.current.id) || player.current) : '';
+    if (!video && document.fullscreenElement === audio) document.exitFullscreen().catch(() => {});
+  }
+
+  /** Is the user typing in a field the video panel would cover? */
+  function typingBehindPanel() {
+    const active = document.activeElement;
+    if (!active || !active.closest('.content > .tabs, .content > .tab-pane')) return false;
+    if (active.isContentEditable || active.tagName === 'TEXTAREA') return true;
+    return active.tagName === 'INPUT' && !['checkbox', 'radio', 'range', 'button', 'submit'].includes(active.type);
+  }
+
+  function showVideo(show) {
+    player.videoHidden = !show;
+    player.videoAutoHidden = false;
+    updateVideoPanel();
+  }
+
+  function toggleFullscreen() {
+    if (!player.current || !isVideo(player.current)) return;
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => {});
+      return;
+    }
+    showVideo(true);
+    if (typeof audio.requestFullscreen === 'function') audio.requestFullscreen().catch(() => {});
+  }
 
   function shuffleArray(items) {
     for (let i = items.length - 1; i > 0; i -= 1) {
@@ -1769,6 +2159,8 @@
       togglePlay();
       return;
     }
+    player.videoHidden = false; // picking something new to play shows its video again
+    player.videoAutoHidden = false;
     player.queue = list.slice();
     player.label = label || '';
     buildOrder(start);
@@ -1778,6 +2170,7 @@
       player.pos = player.order.indexOf(start);
       renderNowPlaying();
       highlightPlaying();
+      updateVideoPanel();
       if (audio.paused) togglePlay();
       return;
     }
@@ -1801,6 +2194,7 @@
       renderNowPlaying();
       highlightPlaying();
       updateSeek();
+      updateVideoPanel();
       return;
     }
     const keep = player.queue.findIndex((t) => t.id === currentId);
@@ -1813,6 +2207,11 @@
     if (!track) return;
     player.pos = pos;
     player.current = track;
+    if (player.videoAutoHidden) {
+      // Hidden for the previous video only because the user was typing: decide again.
+      player.videoHidden = false;
+      player.videoAutoHidden = false;
+    }
     audio.src = mediaUrl(track.id);
     audio.load();
     const attempt = audio.play();
@@ -1825,6 +2224,7 @@
     }
     renderNowPlaying();
     highlightPlaying();
+    updateVideoPanel();
   }
 
   /** A track that cannot be played: report it once, then move on (but never loop over a broken queue). */
@@ -1842,7 +2242,8 @@
 
   function togglePlay() {
     if (!player.current) {
-      if (state.tracks.length) playTracks(state.tracks, 0, state.query ? 'Search results' : 'Library');
+      const tracks = libraryTracks();
+      if (tracks.length) playTracks(tracks, 0, libraryLabel());
       return;
     }
     if (audio.paused) {
@@ -1915,7 +2316,7 @@
     const playing = player.current && !audio.paused && !audio.ended;
     setIcon(button, playing ? 'pause' : 'play');
     button.title = playing ? 'Pause (Space)' : 'Play (Space)';
-    button.disabled = !player.current && !state.tracks.length;
+    button.disabled = !player.current && !libraryTracks().length;
   }
 
   function renderNowPlaying() {
@@ -2001,6 +2402,33 @@
   }
 
   function initPlayer() {
+    $('#video-hide').addEventListener('click', () => showVideo(false));
+    $('#btn-video').addEventListener('click', () => showVideo(true));
+    $('#video-fullscreen').addEventListener('click', toggleFullscreen);
+    // A double-click (full screen) must not pause and resume on its way: the single-click
+    // toggle waits a moment and a double-click cancels it.
+    // Windows lets the second click of a double-click come up to 500 ms later; when the
+    // single-click toggle already ran by then, the double-click undoes it.
+    let clickTimer = null;
+    let lastClickToggle = -Infinity;
+    audio.addEventListener('click', (event) => {
+      if (event.detail > 1) return;
+      clearTimeout(clickTimer);
+      clickTimer = setTimeout(() => {
+        clickTimer = null;
+        lastClickToggle = performance.now();
+        togglePlay();
+      }, 250);
+    });
+    audio.addEventListener('dblclick', () => {
+      if (clickTimer !== null) {
+        clearTimeout(clickTimer);
+        clickTimer = null;
+      } else if (performance.now() - lastClickToggle < 600) {
+        togglePlay();
+      }
+      toggleFullscreen();
+    });
     $('#btn-play').addEventListener('click', togglePlay);
     $('#btn-prev').addEventListener('click', playPrev);
     $('#btn-next').addEventListener('click', () => playNext(false));
@@ -2123,6 +2551,9 @@
       } else if (event.key === 'ArrowLeft' && player.current && !onControl) {
         event.preventDefault();
         audio.currentTime = Math.max(0, audio.currentTime - 5);
+      } else if ((event.key === 'f' || event.key === 'F') && player.current && isVideo(player.current)) {
+        event.preventDefault();
+        toggleFullscreen();
       }
     });
     // After a mouse click the button would keep focus, so Space would re-fire it instead of
@@ -2160,11 +2591,15 @@
       searchTimer = setTimeout(loadLibrary, SEARCH_DEBOUNCE_MS);
     });
     $('#add-selected').addEventListener('click', (event) => openAddToPlaylistMenu(event.currentTarget, [...state.selection]));
+    $('#move-selected').addEventListener('click', (event) => openMoveMenu(event.currentTarget, [...state.selection]));
+    $('#new-folder').addEventListener('click', createFolder);
     $('#clear-selection').addEventListener('click', clearSelection);
     $('#rescan').addEventListener('click', rescanLibrary);
     $('#new-playlist').addEventListener('click', () => createPlaylist([]));
     $('#settings-btn').addEventListener('click', openSettingsDialog);
 
+    initDownloadOptions();
+    renderFolders();
     initPlayer();
     initKeyboard();
 

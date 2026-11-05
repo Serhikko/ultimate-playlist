@@ -53,10 +53,10 @@ tests/                        offline pytest suite; conftest.py fixtures; fake_p
 ## Data flow: paste -> get_provider -> resolve -> jobs -> download -> Library -> UI
 
 ```text
- user pastes a URL          (web UI textbox -> POST /api/jobs {url}, or `up add URL`)
-        |
+ user pastes a URL          (web UI textbox -> POST /api/jobs {url, media, quality, folder},
+        |                    or `up add [--video --quality Q --folder F] URL`)
         v
- JobManager.submit(url)
+ JobManager.submit(url, media=, quality=, folder=)   (bad values -> ValueError -> HTTP 400)
         |  providers.get_provider(url): normalises the URL (strips whitespace, adds https://
         |  when there is no scheme; `spotify:` URIs pass through), then asks each provider in
         |  PROVIDERS order `matches(url)`; the first True wins.
@@ -66,6 +66,9 @@ tests/                        offline pytest suite; conftest.py fixtures; fake_p
         |
         v
  resolver thread: job.status = RESOLVING; refs = provider.resolve(url)
+        |   media "video": refs become as_video_ref(ref, quality) (track id + ":video",
+        |                  extra media/quality); a provider without `supports_video` (Spotify)
+        |                  keeps audio and the job says "<Provider> links are saved as audio"
         |   0 refs -> ERROR  "Nothing to download at that link"
         |   1 ref  -> the same job gets job.track_ref and moves to the download queue
         |   N refs -> the job becomes a parent (status DONE, child_count=N,
@@ -86,6 +89,8 @@ tests/                        offline pytest suite; conftest.py fixtures; fake_p
         |        ProviderError -> ERROR with str(exc); anything else -> ERROR "Unexpected error: ..."
         v
  library.add(track)  -> library.json (atomic write)      job.track = track; job.status = DONE
+        |   job.folder: library.move_tracks([track.id], folder); a failed move leaves the file in
+        |               Unsorted and the job DONE with "Saved to Unsorted, not <folder>: <why>"
         |
         v
  UI: polls GET /api/jobs (1 s while something is active, else 5 s) and GET /api/library?q=;
@@ -96,8 +101,8 @@ tests/                        offline pytest suite; conftest.py fixtures; fake_p
 Things worth knowing about that flow:
 
 - `dest_dir` passed to `download()` is the **library root**. The provider writes intermediate
-  files under `<library>/.incoming/` (short path, Windows MAX_PATH matters) and moves the finished
-  file into the root with `os.replace`.
+  files under `<library>/.incoming/dl-*/` (a folder of its own per download; short path,
+  Windows MAX_PATH matters) and moves the finished file into the root with `os.replace`.
 - De-duplication is by `TrackRef.track_id` (`"<provider>:<source_id>"`), checked right before the
   download. The same YouTube video, or the same Spotify track, is therefore downloaded once, no
   matter how many playlists contain it. There is no de-duplication *across* providers: the same
@@ -114,12 +119,101 @@ Things worth knowing about that flow:
 | `Track(id, provider, source_id, source_url, title, artist, path, album?, duration?, has_cover, file_size, added_at)` | A finished file in the library. `id` must equal the ref's `track_id`. `path` is relative to the library root with forward slashes. `to_dict()` / `from_dict()` (unknown keys ignored) are what `library.json` stores. |
 | `JobStatus` | `queued, resolving, downloading, converting, done, skipped, error, cancelled`; `is_terminal` for the last four. |
 | `ProgressEvent(status, progress?, speed?, eta?, message?)` | What a provider emits through the `progress` callback. `progress` is 0.0..1.0, `speed` bytes/s, `eta` seconds. |
-| `Job(url, provider?, id, status, progress, speed, eta, message, error, parent_id, child_count, track_ref?, track?, created_at, updated_at)` | One unit of queue work. A playlist becomes a parent job plus one child per track. `title` property falls back ref title -> URL. `to_dict()` is the `/api/jobs` payload. |
+| `Job(url, provider?, id, status, progress, speed, eta, message, error, parent_id, child_count, track_ref?, track?, created_at, updated_at, media="audio", quality="", folder="")` | One unit of queue work. A playlist becomes a parent job plus one child per track. `title` property falls back ref title -> URL. `to_dict()` is the `/api/jobs` payload. |
 | `Playlist(name, id, track_ids, created_at, updated_at)` | Ordered list of track ids; dangling ids are pruned against the library. |
 
 IDs for tracks are always `<provider>:<source_id>` (`youtube:<video id>`, `spotify:<track id>`);
 `local:<sha1 of relative path>[:12]` is used by `Library.rescan()` for files that carry no
 `ULTIMATE_PLAYLIST_ID` tag. Job and playlist ids are random 12-hex strings (`new_id()`).
+
+The three `Job` fields at the end (0.4) are the download options picked next to the Download
+button: `media` ("audio" / "video"), `quality` (a key of `config.VIDEO_QUALITIES`, "" for
+audio) and `folder` (where the finished file goes, "" = Unsorted). Children of a playlist and a
+retried job copy them. `Track` did not change: whether a track is a video, and which folder it
+is in, follow from its `path` (`library.media_of`, `library.folder_of`), and the API adds them
+to every track it hands out (`server.app.track_json`: `media`, `folder`).
+
+## Folders and videos (0.4)
+
+- **Folders** are real directories directly under the library folder; Unsorted (`""`) is the
+  library folder itself; a track's folder is the first part of its `path`. `Library.folders()`
+  lists them (directories, plus any folder a track path names; never the app's own, never
+  trash, sync-tool or system ones: a short list of names (`$RECYCLE.BIN`, `System Volume
+  Information`, `.Trashes`, `.stversions`, `@eaDir`, `#recycle`...) and on Windows a
+  directory that is both hidden and system, as the folders Windows protects are; elsewhere
+  also a dot followed by a letter. Hidden alone, or a dot alone, hides nothing: a folder
+  hidden in Explorer or by a NAS, "...And Justice for All" and ".38 Special" are folders.
+  A rescan does not walk into the skipped ones. It drops index entries only inside a folder
+  on the name list (copies an older version indexed there), never because of a folder's
+  attributes, so no track loses its place in a playlist that way; a folder the index names
+  stays listed while it holds tracks). Folder names
+  match the way Windows compares them (`library.folder_key`: case-insensitive one character
+  at a time, so "Flight" is "flight" but "Straße" is not "Strasse", which `str.casefold`
+  would merge); the spelling on disk wins, and `canonical_folders()` / `folder_name_of()`
+  give every track that spelling. `create_folder`, `rename_folder` (renames the directory,
+  rewrites the paths under it in any case), `delete_folder` (moves its tracks back to
+  Unsorted, removes the directory and the empty subfolders that leaves without following or
+  removing a junction or link, and sets `MoveResult.note` when other files keep it) and
+  `move_tracks(ids, folder, follow_renames=False)`. A move never overwrites (" (2)", " (3)"...), except a stale copy
+  of the very track (same id in its tags, not in the index: a re-download after "Remove from
+  library"), retries a few times on Windows' "file in use" (the player streams with range
+  requests, so a file is open only for moments) and reports per track what could not move.
+  Existing folders are looked up by their listed name first (`resolve_folder`), so a folder
+  made in Explorer ("My  Mix", 90 characters) works as it is; `clean_folder_name` applies to
+  new names only (Windows-illegal characters, reserved device names, a leading or trailing
+  dot, the app's own folders, 80 characters), and its `LibraryFolderError` is a `ValueError`
+  whose message the API returns with 400. Rename and remove refuse while the library folder
+  is missing (409), so an unplugged drive is never re-created empty for the next rescan to
+  wipe; `create_folder` creates the library folder only on a fresh install (an empty index).
+  Ids of files that carry none in their tags are `local:<hash of the path>`; a new file at a
+  path a moved track left gets another one. Providers still write into the library folder
+  itself; a download with a folder is moved there afterwards by the `JobManager`, which also
+  moves a track the job finds already in Unsorted (one in another folder stays, and the job
+  says where) and re-targets live jobs when a folder is renamed or removed
+  (`JobManager.retarget_folder`, called by the API routes). The routes can only do that
+  after the library has renamed or removed the folder, and a download may finish in between,
+  so the library itself remembers the folders renamed or removed while the app runs
+  (`folder_key(old) -> new name`, "" when removed, also when other files keep the folder
+  on disk). The downloader's moves pass `follow_renames=True`: under the library's lock they
+  follow a rename to the new name, and for a removed folder they fail, so the file stays in
+  Unsorted and the queue row says why, instead of bringing the old folder back. The memory
+  of a name ends when the user picks an existing folder of that name for new downloads
+  (`JobManager.submit` calls `Library.pick_folder`), makes it, moves tracks into it or renames
+  a folder to it, and when the library folder changes. A picked name that is not a folder now
+  is a stale one (a second tab, a link pasted while the rename ran): `pick_folder` gives a
+  renamed folder's new name, and a removed one stays removed. Whether a folder of that name exists is not the test: a folder
+  kept by a `desktop.ini`, or made again in Explorer, cannot tell a download that raced the
+  removal from one picked afterwards. Otherwise the folder is made when the first file lands
+  (nothing is made for a download that fails, and a library folder that was missing at
+  submit or a retry is no problem).
+- **Videos**: `as_video_ref` gives the video its own id (`youtube:<id>:video`), so the MP3 and
+  the MP4 of one video are two library items and de-duplication still works per kind.
+  `YouTubeProvider.download` reads `ref.extra["media"]` / `["quality"]`; for a video it asks
+  yt-dlp for `ydl_video_format` (YouTube `bv*+ba/b`: best video plus best audio, merged; TikTok
+  one file with picture and sound, not the watermarked copy, never sound only) with
+  `format_sort` from `VIDEO_FORMAT_SORT` (best: `vcodec:h264,res,acodec:aac`, the highest
+  resolution in H.264 with AAC, which plays everywhere; max: `res:2160,fps`, never 8K;
+  720 / 480: `res:N,vcodec:h264,acodec:aac`, a preference, so a site with nothing that small
+  gives its smallest), `merge_output_format` mp4 and `FFmpegVideoRemuxer` instead of
+  `FFmpegExtractAudio`. Naming, tagging (MP4 atoms) and the move into place are the audio
+  pipeline's. Every download (audio or video) works in its own `.incoming/dl-*` folder,
+  removed in a `finally`: the MP3 and the MP4 of one video may run at once, and yt-dlp names
+  its files after the video id alone. The tests run each quality through yt-dlp's own
+  selection on YouTube- and TikTok-shaped format lists. `Library` picks up
+  `.mp4 .m4v .webm .mkv .mov` on a rescan.
+- **API**: `GET /api/folders` -> `{unsorted, folders: [{name, count}]}`; `POST /api/folders
+  {name}`; `PATCH /api/folders/{name} {name}`; `DELETE /api/folders/{name}` (tracks back to
+  Unsorted; `note` when the folder stays on disk); `POST /api/library/move {track_ids,
+  folder}` -> `{moved, failed: [{id, error}], note, unsorted, folders}`. Rename and remove
+  answer 409 while the library folder is missing. Tracks in `/api/library` and in the job
+  routes carry `media` and `folder`. `/media/{id}` serves videos as `video/mp4` (or webm /
+  matroska / quicktime).
+- **UI**: the download bar has the Audio / Video toggle, the quality menu (video only) and Save
+  to (remembered in `localStorage`, key `ultimate-playlist.download`). The Library tab has the
+  folder rail (All tracks, Unsorted, folders; rows drop onto it), Move to folder in the
+  selection bar and on every row. The player's one media element is a `<video>` inside
+  `#video-panel`, which covers the library while a video plays; with the panel hidden it plays
+  audio and video alike.
 
 ## The Provider protocol (`providers/base.py`)
 
@@ -324,7 +418,9 @@ The audio file itself carries enough to rebuild the index: `TPE1` artist, `TIT2`
 album, `COMM` = source URL, `APIC` cover, and a `TXXX` frame with description
 `ULTIMATE_PLAYLIST_ID` holding the track id (Spotify tracks add a second `TXXX` frame,
 `YOUTUBE_ID`, with the video the audio came from). `Library.rescan()` walks the library folder
-(skipping `.incoming/` and `Playlists/`), reads those tags with mutagen, and recovers the id from
+(skipping `.incoming/`, `Playlists/`, trash and sync-tool folders such as `$RECYCLE.BIN` and
+`.stversions`, on Windows any folder both hidden and system, elsewhere any folder named with a
+dot followed by a letter), reads those tags with mutagen, and recovers the id from
 the `TXXX` frame. Any provider must write that frame, otherwise its tracks come back as
 `local:...` after a rescan.
 
@@ -338,7 +434,7 @@ the `TXXX` frame. Any provider must write that frame, otherwise its tracks come 
   return False.
 - `resolve`: `yt_dlp.YoutubeDL(...).extract_info(url, download=False)` with `extract_flat`, so a
   playlist costs one request. `DownloadError` becomes `ProviderError(friendly_error(exc))`.
-- `download`: yt-dlp downloads `bestaudio` into `<library>/.incoming/<id>.<ext>`, its
+- `download`: yt-dlp downloads `bestaudio` into `<library>/.incoming/dl-*/<id>.<ext>`, its
   post-processors convert to MP3, add metadata and embed the thumbnail. The provider then decides
   `artist, title = pick_artist_title(info)`, rewrites the tags on the file still inside
   `.incoming/` with `write_tags(path, artist, title, album, source_url, track_id)` (keeps the
@@ -348,8 +444,9 @@ the `TXXX` frame. Any provider must write that frame, otherwise its tracks come 
   already holds this very track so a re-download replaces it, else the first free ` (n)` name;
   `unique_path` remains a simpler helper that only looks for a free name) and moves the file
   with `os.replace`; name pick and move happen under one module lock so two workers finishing
-  the same "Artist - Title" cannot overwrite each other. Leftovers in `.incoming/<id>.*` are
-  removed in a `finally`.
+  the same "Artist - Title" cannot overwrite each other. The `dl-*` folder (made with
+  `tempfile.mkdtemp`) and whatever is left in it are removed in a `finally`; only a hard kill
+  of the process leaves one behind, and it is safe to delete.
 - `doctor`: ffmpeg (via `ffmpeg.find_ffmpeg`), JavaScript runtime (Deno or Node), yt-dlp version.
 
 The pure helpers (`split_artist_title`, `clean_title`, `safe_filename`, `unique_path`,
@@ -615,7 +712,7 @@ gives the whole pipeline for free: MP3 conversion with the user's `audio_quality
 events, cancel handling (`DownloadCancelled` simply propagates), friendly yt-dlp errors,
 cleanup. Note the `dest_dir`: each Spotify download gets a **staging folder of its own**,
 `<library>/.incoming/sp-<spotify id>-<8 random hex>/`, and the YouTube step runs with that as
-its "library root", so yt-dlp's temporary files land in `<staging>/.incoming/<video id>.*` and
+its "library root", so yt-dlp's temporary files land in `<staging>/.incoming/dl-*/<video id>.*` and
 its finished, YouTube-named file in `<staging>/`. Had it been given the real library root, an
 existing YouTube-provider file of the same video would have been replaced and then renamed
 away; had two Spotify downloads shared one staging folder, two tracks matched to the same video

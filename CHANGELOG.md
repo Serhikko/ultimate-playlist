@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.4.0 (2026-11-05)
+
+Folders and videos.
+
+- **Folders**: the Library tab lists All tracks, Unsorted and your folders. Make one with the +
+  button, drag tracks onto it or use Move to folder (selection bar and every row), rename or
+  remove it (its tracks go back to Unsorted; nothing is deleted). Folders are real directories
+  in the library folder, so one can be copied to a phone or a USB stick as it is; moving a
+  track moves its file and keeps it in its playlists.
+- **Save to**: a menu next to the Download button picks the folder new downloads land in,
+  remembered between visits; a playlist link fills that folder directly (tracks you already
+  have move in from Unsorted; one sorted into another folder stays there and its queue row
+  says where). Downloads still on their way follow a renamed or removed folder.
+- **Videos**: an Audio / Video toggle next to the link box downloads YouTube and TikTok videos
+  as MP4, in Best (the highest resolution in H.264, plays everywhere), Maximum (up to 4K),
+  720p or 480p (about that size). A video is its own library item (`youtube:<id>:video`), next to the MP3 of the
+  same video. Spotify links stay audio; a TikTok photo slideshow has no video and says so.
+- The player plays videos in a panel over the library: click to pause, double-click or F for
+  full screen, × hides it while it keeps playing (the video button in the player bar brings it
+  back). MP4, M4V, WebM, MKV and MOV files in the library folder are picked up by Rescan.
+- Rescan no longer walks into trash and sync-tool folders (`$RECYCLE.BIN` when the library is
+  a drive's root, `.stversions`, `.Trashes`, a NAS's `#recycle`...) or folders Windows
+  protects (hidden and system), and on macOS and Linux not into folders named with a dot
+  followed by a letter (".cache"); old copies an earlier version indexed from a trash folder
+  leave the library. A folder you hid in Explorer, and one whose name starts with a dot not
+  followed by a letter ("...And Justice for All", ".38 Special"), is music as before.
+- Queue rows say what a link becomes ("Video · 720p → Flight"); library rows tag videos (MP4)
+  and, in All tracks, their folder.
+- `up add --video --quality best|max|720|480 --folder NAME`. API: `POST /api/jobs` takes
+  `media`, `quality` and `folder`; new `/api/folders` routes and `POST /api/library/move`;
+  tracks carry `media` and `folder`.
+- TikTok: a hashtag glued to a word ("МЕНТАЛИСТ#recommendations") is removed from the title too,
+  and a display name made only of symbols ("♡") gives way to the @handle.
+
 ## 0.3.0 (2026-11-05)
 
 TikTok links.

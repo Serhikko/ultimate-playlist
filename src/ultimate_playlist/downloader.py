@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import queue
 import threading
@@ -10,9 +11,9 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
-from .config import Settings
-from .library import Library
-from .models import Job, JobStatus, ProgressEvent, TrackRef, utc_now_iso
+from .config import DEFAULT_VIDEO_QUALITY, Settings, clean_media, clean_video_quality
+from .library import Library, folder_key
+from .models import Job, JobStatus, ProgressEvent, Track, TrackRef, utc_now_iso
 from .providers.base import DownloadCancelled, Provider, ProviderError
 
 log = logging.getLogger(__name__)
@@ -21,8 +22,21 @@ PROGRESS_INTERVAL = 0.25  # seconds between progress copies onto the job (~4 upd
 STOP_JOIN_TIMEOUT = 30.0
 QUEUE_POLL_INTERVAL = 1.0  # idle threads wake up this often to notice a shrink or a restart
 MAX_WORKERS = 6
+# The video of a track is a library item of its own: "youtube:<id>:video" next to the MP3's
+# "youtube:<id>", so one can be downloaded while the other is in the library.
+VIDEO_ID_SUFFIX = ":video"
 
 _Queue = queue.Queue[str | None]
+
+
+def as_video_ref(ref: TrackRef, quality: str) -> TrackRef:
+    """The ref for the video download of `ref`: its own track id, and the choice in `extra`
+    (``media`` / ``quality``) for the provider's download()."""
+    source_id = ref.source_id
+    if not source_id.endswith(VIDEO_ID_SUFFIX):
+        source_id += VIDEO_ID_SUFFIX
+    extra = {**ref.extra, "media": "video", "quality": quality or DEFAULT_VIDEO_QUALITY}
+    return dataclasses.replace(ref, source_id=source_id, extra=extra)
 
 
 class ProviderRegistry(Protocol):
@@ -83,6 +97,9 @@ class JobManager:
         # They get their turn if the job that claimed the track does not end with the file in
         # the library (cancelled, failed), instead of staying a misleading dead end.
         self._deferred: dict[str, list[str]] = {}
+        # Job id -> a note the finished job keeps ("Spotify links are saved as audio"), so the
+        # progress messages of the download do not wipe it out.
+        self._notes: dict[str, str] = {}
         self._resolve_q: _Queue = queue.Queue()
         self._download_q: _Queue = queue.Queue()
         self._resolver: threading.Thread | None = None
@@ -188,18 +205,30 @@ class JobManager:
 
     # -- public API --------------------------------------------------------------------------
 
-    def submit(self, url: str) -> Job:
-        """Validate the link with the registry and queue it for resolving."""
+    def submit(self, url: str, *, media: str = "audio", quality: str = "", folder: str = "") -> Job:
+        """Validate the link with the registry and queue it for resolving.
+
+        `media` is "audio" or "video", `quality` a video quality key (ignored for audio),
+        `folder` the library folder the finished files go to ("" = Unsorted). Bad values raise
+        ValueError with a message for the user.
+        """
         url = (url or "").strip()
         normalize = getattr(self.providers, "normalize_url", None)
         if callable(normalize):
             url = normalize(url)
         if not url:
             raise ValueError("Paste a link first")
+        media = clean_media(media)
+        quality = clean_video_quality(quality) if media == "video" else ""
+        folder = self.library.resolve_folder(folder)  # an existing folder as listed, or a new name
         provider = self.providers.get_provider(url)
         if provider is None:
             raise ValueError("No provider for this link")
-        job = Job(url=url, provider=provider.name)
+        if folder:
+            # Picked now: this download goes there even if a folder of that name was renamed
+            # or removed earlier (downloads already on their way when that happened do not).
+            folder = self.library.pick_folder(folder)
+        job = Job(url=url, provider=provider.name, media=media, quality=quality, folder=folder)
         with self._lock:
             self._jobs[job.id] = job
             self._cancel_events[job.id] = threading.Event()
@@ -247,6 +276,9 @@ class JobManager:
                 provider=old.provider,
                 parent_id=old.parent_id,
                 track_ref=old.track_ref,
+                media=old.media,
+                quality=old.quality,
+                folder=old.folder,
             )
             self._jobs[new.id] = new
             self._cancel_events[new.id] = threading.Event()
@@ -421,6 +453,19 @@ class JobManager:
             self._finish(job, JobStatus.ERROR, error=f"Unexpected error: {exc}", message=None)
             return
 
+        # A provider without video (Spotify: its songs come from YouTube Music's audio) saves
+        # audio even when Video was picked; the queue says so.
+        audio_only = job.media == "video" and not getattr(provider, "supports_video", False)
+        note = None
+        if audio_only:
+            name = getattr(provider, "display_name", provider.name)
+            note = f"{name} links are saved as audio"
+            with self._lock:
+                self._update(job, media="audio", quality="")
+                self._notes[job.id] = note
+        if job.media == "video":
+            refs = [as_video_ref(ref, job.quality) for ref in refs]
+
         with self._lock:
             if cancel.is_set():
                 self._finish(job, JobStatus.CANCELLED, message="Cancelled")
@@ -435,7 +480,7 @@ class JobManager:
                 if self._claimed_elsewhere(refs[0].track_id, job, include_queued=True):
                     self._skip_as_duplicate(job)
                     return
-                self._update(job, status=JobStatus.QUEUED, message=None)
+                self._update(job, status=JobStatus.QUEUED, message=note)
                 self._download_q.put(job.id)
                 return
             children: list[tuple[Job, TrackRef]] = []
@@ -445,16 +490,20 @@ class JobManager:
                     provider=ref.provider or provider.name,
                     parent_id=job.id,
                     track_ref=ref,
+                    media=job.media,
+                    quality=job.quality,
+                    folder=job.folder,
                 )
                 self._jobs[child.id] = child
                 self._cancel_events[child.id] = threading.Event()
                 children.append((child, ref))
+            message = _parent_message(refs, len(children))
             self._update(
                 job,
                 status=JobStatus.DONE,
                 child_count=len(children),
                 progress=1.0,
-                message=_parent_message(refs, len(children)),
+                message=f"{message}; {note}" if note else message,
             )
             for child, ref in children:
                 if self._claimed_elsewhere(ref.track_id, child, include_queued=True):
@@ -528,6 +577,7 @@ class JobManager:
             )
             return
 
+        existing: Track | None = None
         with self._lock:
             if job.status != JobStatus.QUEUED or cancel.is_set():
                 self._finish(job, JobStatus.CANCELLED, message="Cancelled")
@@ -536,15 +586,32 @@ class JobManager:
             # the download of this very track cannot slip in between "not in the library yet"
             # and its own claim and download the file a second time.
             if self.library.has(ref.track_id):
-                self._finish(job, JobStatus.SKIPPED, progress=1.0, message="Already in library")
-                return
-            if self._claimed_elsewhere(ref.track_id, job, include_queued=False):
+                existing = self.library.get(ref.track_id)
+                if not self._moves_into_folder(job, existing):
+                    message = self._already_there(job, existing)
+                    self._finish(job, JobStatus.SKIPPED, progress=1.0, message=message)
+                    return
+                # Saved to a folder and sitting in Unsorted: it joins the folder (below, outside
+                # the lock: a move is file I/O). The job stays live until then, so wait_idle()
+                # and the queue see the final message.
+                self._update(job, status=JobStatus.CONVERTING, progress=1.0, message=None)
+            elif self._claimed_elsewhere(ref.track_id, job, include_queued=False):
                 self._skip_as_duplicate(job)
                 return
-            self._in_flight.add(ref.track_id)
-            self._update(
-                job, status=JobStatus.DOWNLOADING, progress=0.0, speed=None, eta=None, error=None
-            )
+            else:
+                self._in_flight.add(ref.track_id)
+                self._update(
+                    job,
+                    status=JobStatus.DOWNLOADING,
+                    progress=0.0,
+                    speed=None,
+                    eta=None,
+                    error=None,
+                )
+        if existing is not None:
+            message = self._move_existing(job, existing)
+            self._finish(job, JobStatus.SKIPPED, progress=1.0, message=message)
+            return
         outcome: tuple[JobStatus, dict[str, object]] | None = None
         try:
             outcome = self._run_download(job, ref, provider, dest_dir, settings, cancel)
@@ -558,6 +625,49 @@ class JobManager:
                     status, fields = outcome
                     self._finish(job, status, **fields)
                 self._release_deferred(ref.track_id)
+
+    def _moves_into_folder(self, job: Job, existing: Track | None) -> bool:
+        """A track already in the library joins the job's folder only from Unsorted: taking it
+        out of a folder the user sorted it into would empty that one to fill this one."""
+        if not job.folder or existing is None:
+            return False
+        return self.library.folder_name_of(existing.path) == ""
+
+    def _already_there(self, job: Job, existing: Track | None) -> str:
+        if job.folder and existing is not None:
+            folder = self.library.folder_name_of(existing.path)
+            if folder and folder_key(folder) != folder_key(job.folder):
+                return f"Already in library (in {folder})"
+        return "Already in library"
+
+    def _move_existing(self, job: Job, existing: Track) -> str:
+        folder = job.folder
+        try:
+            # follow_renames: the folder may have been renamed or removed since the job began.
+            moves = self.library.move_tracks([existing.id], folder, follow_renames=True)
+            failed = moves.failed
+        except Exception as exc:  # noqa: BLE001 - the track stays where it was either way
+            log.exception("Could not move %s to %s", existing.path, folder)
+            failed = [(existing.id, str(exc))]
+        if failed:
+            return f"Already in library; not moved to {folder}: {failed[0][1]}"
+        moved = self.library.get(existing.id)
+        return f"Already in library; moved to {self.library.folder_name_of(moved.path) if moved else folder}"
+
+    def retarget_folder(self, old: str, new: str) -> int:
+        """Jobs saving to folder `old` follow it after a rename (`new`) or a removal (new "":
+        Unsorted), so a playlist still downloading does not bring the old folder back.
+        Returns how many jobs changed."""
+        if not old:
+            return 0
+        wanted = folder_key(old)
+        changed = 0
+        with self._lock:
+            for job in self._jobs.values():
+                if job.folder and folder_key(job.folder) == wanted:
+                    self._update(job, folder=new)
+                    changed += 1
+        return changed
 
     def _run_download(
         self,
@@ -589,7 +699,24 @@ class JobManager:
                 "error": f"Downloaded, but the library index could not be updated: {exc}",
                 "message": None,
             }
-        return JobStatus.DONE, {"track": track, "progress": 1.0, "message": None}
+        with self._lock:
+            message = self._notes.pop(job.id, None)
+        folder = job.folder
+        if folder:
+            # Providers always write into the library folder itself; the chosen folder is a
+            # move afterwards, the same one the library's Move to folder does. It is made when
+            # the first file lands, and follows a rename or removal made since the job began
+            # (the API re-targets the jobs only after the library has done it).
+            try:
+                result = self.library.move_tracks([track.id], folder, follow_renames=True)
+                failed = result.failed
+            except Exception as exc:  # noqa: BLE001 - the file is safe in Unsorted either way
+                log.exception("Could not move %s to %s", track.path, folder)
+                failed = [(track.id, str(exc))]
+            if failed:
+                message = f"Saved to Unsorted, not {folder}: {failed[0][1]}"
+            track = self.library.get(track.id) or track
+        return JobStatus.DONE, {"track": track, "progress": 1.0, "message": message}
 
     def _progress_callback(self, job_id: str) -> Callable[[ProgressEvent], None]:
         last_copy = 0.0

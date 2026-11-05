@@ -27,12 +27,54 @@ macOS, Linux, or running from source: [Requirements](#requirements) onward.
   `/playlist?list=...` link downloads the whole playlist (private and deleted entries are
   skipped, the rest are reported per track). Also TikTok videos and photo slideshows,
   short links included (see [TikTok](#tiktok)).
-- Downloads the best available audio and converts it to MP3 (VBR, best quality) with ffmpeg.
+- Downloads the best available audio and converts it to MP3 (VBR, best quality) with ffmpeg,
+  or, with **Video** picked next to the Download button, the video as MP4 in the quality you
+  choose (see [Videos](#videos)).
 - Writes ID3 tags (artist, title, album, source URL) and embeds the cover art.
-- Keeps everything in one flat folder as `Artist - Title.mp3`. The same track is never
-  downloaded twice.
+- Names files `Artist - Title.mp3` and sorts them into **folders** of your own (Unsorted,
+  Music, TikTok, Flight...): real folders inside the library folder, so one can be copied to a
+  phone or a USB stick as it is (see [Folders](#folders)). The same track is never downloaded
+  twice.
 - Playlists: create, reorder, export as `.m3u8` with relative paths, so the whole folder can be
-  copied to a USB stick or a phone as it is. Built-in player with queue, shuffle and repeat.
+  copied to a USB stick or a phone as it is. Built-in player with queue, shuffle and repeat;
+  videos play in a panel over the library.
+
+## Folders
+
+The Library tab lists your folders on the left: **All tracks**, **Unsorted** (the library
+folder itself) and every folder you make (the **+** button).
+
+- **New downloads**: pick the folder in the **Save to** menu next to the Download button
+  (its **New folder…** entry makes one on the spot). The choice is remembered, so a playlist
+  link fills "Flight" without any sorting afterwards. Tracks of that playlist you already have
+  in Unsorted move into the folder too; one you sorted into another folder stays there (a
+  file is in one folder at a time), and its queue row says where it is.
+- **Moving tracks**: drag rows onto a folder, or tick them and use **Move to folder** (every
+  row also has a folder button). Moving moves the file on disk; playlists keep working.
+- **Rename / remove**: hover a folder (or Tab to it). Removing a folder puts its tracks back in
+  Unsorted; nothing is deleted. Downloads still on their way to a renamed or removed folder
+  follow it.
+- A folder is a real directory: `Music\Ultimate Playlist\Flight\...`, and a folder you make
+  in Explorer shows up too. Files the app downloaded carry their id in their tags, so moving
+  them between folders in Explorer and pressing **Rescan** keeps them in their playlists;
+  move your own files (copied in from elsewhere) with the app's Move to folder instead.
+
+## Videos
+
+Switch the toggle next to the link box from **Audio** to **Video** and pick a quality:
+
+| Quality | What you get |
+| --- | --- |
+| Best (plays everywhere) | the highest resolution in H.264 MP4 with AAC sound, usually 1080p: plays on any phone, tablet, TV and in the app |
+| Maximum (up to 4K) | the highest resolution up to 4K (often VP9/AV1): bigger files, newer devices only |
+| 720p / 480p | about that resolution (the smallest there is when a site has nothing that small, as on TikTok), H.264: small files for a phone |
+
+Videos are YouTube and TikTok (a TikTok photo slideshow has no video; download it as Audio).
+Spotify links stay audio: their songs come from YouTube Music's audio. A video is a library
+item of its own (`youtube:<id>:video`), so a song can be there as MP3 and as MP4. It plays in a
+panel over the library (click it to pause, double-click or **F** for full screen, the **×**
+hides it while it keeps playing); a whole YouTube playlist downloaded as Video into a folder
+is a ready offline playlist for a flight.
 
 ## Spotify
 
@@ -242,6 +284,8 @@ uv run up add https://www.youtube.com/watch?v=dQw4w9WgXcQ    # download, print p
 uv run up add https://open.spotify.com/album/<id>            # Spotify links work the same way
 uv run up add <url> <url> <url>                              # several links (or a playlist link)
 uv run up add -q <url>                                       # quiet: only the final summary (still waits for the downloads)
+uv run up add --folder Flight <url>                          # into a library folder (created if needed)
+uv run up add --video --quality 720 <url>                    # the video as MP4 (best, max, 720, 480; default best)
 uv run up doctor                                             # check ffmpeg, JS runtime, yt-dlp, folders; show which Spotify route is used
 uv run up list                                               # tracks in the library (id, artist, title, duration, path)
 uv run up list -q daft                                       # search title / artist / album
@@ -272,7 +316,7 @@ and `uv run python -m ultimate_playlist` are the same as `uv run up`.
 
 | What | Where |
 | --- | --- |
-| Music library (the MP3s) | `~/Music/Ultimate Playlist` (Windows: the Music folder Explorer shows, so `C:\Users\<you>\Music\Ultimate Playlist` or `C:\Users\<you>\OneDrive\Music\Ultimate Playlist` when OneDrive manages it) |
+| Music library (the MP3s and MP4s) | `~/Music/Ultimate Playlist` (Windows: the Music folder Explorer shows, so `C:\Users\<you>\Music\Ultimate Playlist` or `C:\Users\<you>\OneDrive\Music\Ultimate Playlist` when OneDrive manages it); your folders are directories inside it |
 | Exported playlists | `<library>/Playlists/<name>.m3u8` |
 | Temporary download files | `<library>/.incoming/` (cleaned up automatically; safe to empty while the app is closed) |
 | Config, index, playlists, log | `~/.ultimate-playlist/` : `config.json`, `library.json`, `playlists.json`, `app.log` |
@@ -301,7 +345,9 @@ restriction for LAN use.
 
 ## How naming and tagging work
 
-- Files are named `Artist - Title.mp3`, flat in the library folder (no per-artist sub-folders).
+- Files are named `Artist - Title.mp3` (a video: `Artist - Title.mp4`), in the library folder
+  itself (Unsorted) or in the folder picked for the download (no automatic per-artist
+  sub-folders).
   For YouTube links, artist and title come from YouTube's music metadata when the video has it
   (YouTube Music tracks, "Topic" uploads); otherwise junk such as `(Official Video)`,
   `[Official Audio]`, `(Lyrics)`, `(HD)`, a trailing `- Official Video` / `| Lyrics` and a
@@ -321,14 +367,16 @@ restriction for LAN use.
 - Tags are ID3v2: artist, title, album (when known), comment = the source URL (the YouTube
   video, the Spotify track page or the TikTok post), the cover (the video thumbnail, Spotify's
   album art or the TikTok cover), and a hidden `ULTIMATE_PLAYLIST_ID` tag
-  (`youtube:<video id>`, `spotify:<track id>` or `tiktok:<post id>`) so a
+  (`youtube:<video id>`, `spotify:<track id>` or `tiktok:<post id>`, with `:video` added for a
+  video) so a
   rescan can recognise a file even after you rename or move it inside the folder. Spotify
   tracks also carry a hidden `YOUTUBE_ID` tag with the video the audio came from, plus album
   artist, track number, release year and ISRC when Spotify provided them. With
   `audio_format` set to `m4a`, `opus` or `flac` the same fields are written in that container's
-  own tag format (MP4 atoms / Vorbis comments); only MP3 is exercised end to end.
-- Files you copy into the folder from elsewhere are picked up by `rescan` (MP3, M4A, Opus, FLAC),
-  with their existing tags, under a `local:` id.
+  own tag format (MP4 atoms / Vorbis comments); only MP3 is exercised end to end. Videos
+  (MP4) carry the same fields as MP4 atoms.
+- Files you copy into the folder from elsewhere are picked up by `rescan` (MP3, M4A, Opus, FLAC,
+  and the videos MP4, M4V, WebM, MKV, MOV), with their existing tags, under a `local:` id.
 
 ## Troubleshooting (running from source)
 
@@ -359,7 +407,7 @@ section above; the commands below assume a source checkout.
 - **"Could not reach Spotify"**: no internet, or Spotify is down; the YouTube side is not
   involved yet at that point. Try again in a minute.
 - **Long paths on Windows**: Windows refuses paths longer than 260 characters unless long paths
-  are enabled. The app keeps temporary files short (`<library>/.incoming/<video id>.mp3`) and caps
+  are enabled. The app keeps temporary files short (`<library>/.incoming/dl-<random>/<video id>.mp3`) and caps
   file names at 150 characters, but a deeply nested library folder can still hit the limit. Use a
   short library path (for example `D:\Music\UP`), or enable long paths: Group Policy
   `Computer Configuration > Administrative Templates > System > Filesystem > Enable Win32 long
@@ -372,7 +420,7 @@ section above; the commands below assume a source checkout.
 - **"Rescan" says the library folder is not reachable**: the folder was renamed or lives on a
   drive that is unplugged. Nothing is changed in that case (the index and your playlists are
   kept); plug the drive in, or point `library_dir` at the new place, and rescan again.
-- **"HTTP Error 403" / "YouTube refused to serve the audio"**: not a network problem; YouTube
+- **"HTTP Error 403" / "YouTube refused to serve the download"**: not a network problem; YouTube
   changed something. Update yt-dlp as described above.
 - **Logs**: `~/.ultimate-playlist/app.log` (rotated, 1 MB x 3). With `up serve` the terminal
   shows the startup lines, one line per Spotify track naming the YouTube video it was matched
@@ -397,12 +445,14 @@ it. The app uploads nothing and shares nothing; everything stays on your machine
   a settings dialog, the `up` command line, playlists, M3U8 export, built-in player, Windows
   no-install zip.
 - **0.3**: TikTok videos and photo slideshows, short links included.
+- **0.4**: folders (real directories, drag and drop, a Save to choice per
+  download), videos as MP4 in four qualities, a video panel in the player.
 - Not yet: a song downloaded once from a YouTube link and once from a Spotify link is two files
   (no cross-source de-duplication); whole YouTube channels; TikTok profiles and collections;
   signing in to YouTube or TikTok (private and age-restricted posts); other people's Spotify
   playlists beyond their first 100 songs (a
-  Spotify rule); formats other than MP3 (the setting exists but only MP3 is tested); per-artist
-  sub-folders.
+  Spotify rule); audio formats other than MP3 (the setting exists but only MP3 is tested);
+  folders inside folders (the app shows the top level; deeper files count to their top folder).
 
 ## Development
 

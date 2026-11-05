@@ -46,9 +46,19 @@ from ..config import (
 )
 from ..downloader import JobManager
 from ..ffmpeg import find_ffmpeg
-from ..library import Library, LibraryFileInUse, LibraryUnavailable
+from ..library import (
+    UNSORTED,
+    Library,
+    LibraryFileInUse,
+    LibraryFolderError,
+    LibraryUnavailable,
+    MoveResult,
+    folder_key,
+    folder_of,
+    media_of,
+)
 from ..logs import install_handlers, log_file_path
-from ..models import Job, Playlist
+from ..models import Job, Playlist, Track
 from ..playlists import PlaylistNotFound, PlaylistStore, export_m3u8, m3u8_text
 from ..providers import run_doctor
 from ..providers.base import ProviderError
@@ -77,6 +87,11 @@ _MEDIA_TYPES = {
     ".m4a": "audio/mp4",
     ".opus": "audio/ogg",
     ".flac": "audio/flac",
+    ".mp4": "video/mp4",
+    ".m4v": "video/mp4",
+    ".webm": "video/webm",
+    ".mkv": "video/x-matroska",
+    ".mov": "video/quicktime",
 }
 _ILLEGAL_NAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
 # Device names Windows reserves whatever the extension ("CON.m3u8" opens the console).
@@ -112,6 +127,18 @@ _MASK = "********"
 
 class JobRequest(BaseModel):
     url: str
+    media: str = "audio"  # "audio" | "video"
+    quality: str = ""  # video quality key (config.VIDEO_QUALITIES); ignored for audio
+    folder: str = ""  # library folder for the finished files ("" = Unsorted)
+
+
+class FolderName(BaseModel):
+    name: str
+
+
+class MoveRequest(BaseModel):
+    track_ids: list[str]
+    folder: str = ""  # "" = Unsorted
 
 
 class SettingsPatch(BaseModel):
@@ -154,6 +181,29 @@ def safe_playlist_filename(name: str) -> str:
     if text.split(".", 1)[0].strip().upper() in _WINDOWS_RESERVED:
         text = "_" + text
     return text
+
+
+def track_json(track: Track, canonical: dict[str, str] | None = None) -> dict[str, Any]:
+    """A track as the API hands it out: the index entry plus `media` ("audio" / "video", from
+    the file's extension) and `folder` (the library folder it sits in, "" = Unsorted), spelled
+    as the folder list spells it when `canonical` (Library.canonical_folders()) is given."""
+    folder = folder_of(track.path)
+    if folder and canonical:
+        folder = canonical.get(folder_key(folder), folder)
+    return {**track.to_dict(), "media": media_of(track.path), "folder": folder}
+
+
+def with_track_fields(
+    job: dict[str, Any], canonical: dict[str, str] | None = None
+) -> dict[str, Any]:
+    """A job dict (Job.to_dict) whose finished track carries `media` and `folder` too."""
+    track = job.get("track")
+    if isinstance(track, dict) and isinstance(track.get("path"), str):
+        folder = folder_of(track["path"])
+        if folder and canonical:
+            folder = canonical.get(folder_key(folder), folder)
+        job["track"] = {**track, "media": media_of(track["path"]), "folder": folder}
+    return job
 
 
 def media_type_for(path: Path) -> str:
@@ -681,14 +731,17 @@ def create_app(
         created = []
         for link in links:
             try:
-                created.append(jobs.submit(link).to_dict())
-            except ValueError as exc:
+                job = jobs.submit(link, media=body.media, quality=body.quality, folder=body.folder)
+            except ValueError as exc:  # a bad link, media, quality or folder name
                 raise HTTPException(400, str(exc)) from exc
-        return {"jobs": created}
+            created.append(job.to_dict())
+        canonical = library.canonical_folders()
+        return {"jobs": [with_track_fields(j, canonical) for j in created]}
 
     @app.get("/api/jobs")
     def get_jobs() -> dict[str, Any]:
-        return {"jobs": jobs.snapshot()}
+        canonical = library.canonical_folders()
+        return {"jobs": [with_track_fields(j, canonical) for j in jobs.snapshot()]}
 
     @app.delete("/api/jobs/finished")
     def delete_finished_jobs() -> dict[str, Any]:
@@ -698,7 +751,7 @@ def create_app(
     def cancel_job(job_id: str) -> dict[str, Any]:
         job = require_job(job_id)
         cancelled = jobs.cancel(job_id)
-        return {"cancelled": cancelled, "job": job.to_dict()}
+        return {"cancelled": cancelled, "job": with_track_fields(job.to_dict())}
 
     @app.post("/api/jobs/{job_id}/retry")
     def retry_job(job_id: str) -> dict[str, Any]:
@@ -709,7 +762,7 @@ def create_app(
                 409,
                 f"Only failed or cancelled jobs can be retried (this one is {job.status.value}).",
             )
-        return {"job": new_job.to_dict()}
+        return {"job": with_track_fields(new_job.to_dict())}
 
     # -- library -----------------------------------------------------------------------------
 
@@ -717,7 +770,66 @@ def create_app(
     def get_library(
         q: str = Query("", description="Search over title, artist and album"),
     ) -> dict[str, Any]:
-        return {"tracks": [t.to_dict() for t in library.search(q)]}
+        canonical = library.canonical_folders()
+        return {"tracks": [track_json(t, canonical) for t in library.search(q)]}
+
+    # -- folders -----------------------------------------------------------------------------
+
+    def folders_json() -> dict[str, Any]:
+        counts = library.folder_counts()
+        return {
+            "unsorted": counts.get(UNSORTED, 0),
+            "folders": [{"name": f, "count": counts.get(f, 0)} for f in library.folders()],
+        }
+
+    def move_json(result: MoveResult) -> dict[str, Any]:
+        return {
+            "moved": result.moved,
+            "failed": [{"id": tid, "error": reason} for tid, reason in result.failed],
+            "note": result.note,
+            **folders_json(),
+        }
+
+    @app.get("/api/folders")
+    def get_folders() -> dict[str, Any]:
+        return folders_json()
+
+    @app.post("/api/folders", status_code=201)
+    def create_folder(body: FolderName) -> dict[str, Any]:
+        try:
+            name = library.create_folder(body.name)
+        except LibraryFolderError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {"name": name, **folders_json()}
+
+    @app.patch("/api/folders/{name}")
+    def rename_folder(name: str, body: FolderName) -> dict[str, Any]:
+        try:
+            new_name = library.rename_folder(name, body.name)
+        except LibraryFolderError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        jobs.retarget_folder(name, new_name)  # a playlist still downloading follows the rename
+        return {"name": new_name, **folders_json()}
+
+    @app.delete("/api/folders/{name}")
+    def delete_folder(name: str) -> dict[str, Any]:
+        """The folder's tracks go back to Unsorted (nothing is deleted from disk)."""
+        try:
+            result = library.delete_folder(name)
+        except LibraryFolderError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        jobs.retarget_folder(name, UNSORTED)  # downloads still on their way land in Unsorted
+        return move_json(result)
+
+    @app.post("/api/library/move")
+    def move_tracks(body: MoveRequest) -> dict[str, Any]:
+        """Move tracks' files into a folder ("" = Unsorted); a folder that does not exist yet is
+        created. Tracks that cannot be moved are listed in `failed`, the others move anyway."""
+        try:
+            result = library.move_tracks(body.track_ids, body.folder)
+        except LibraryFolderError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return move_json(result)
 
     @app.post("/api/library/rescan")
     def rescan_library() -> dict[str, Any]:

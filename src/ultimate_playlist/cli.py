@@ -24,8 +24,10 @@ from urllib.parse import urlsplit
 from . import __version__
 from .bundled import is_frozen
 from .config import (
+    DEFAULT_VIDEO_QUALITY,
     MAX_CONCURRENCY,
     MIN_CONCURRENCY,
+    VIDEO_QUALITIES,
     Settings,
     app_data_dir,
     clean_audio_format,
@@ -33,6 +35,7 @@ from .config import (
     clean_client_id,
     clean_concurrency,
     clean_js_runtimes,
+    clean_video_quality,
 )
 from .ffmpeg import find_ffmpeg, install_hint
 from .library import Library, LibraryUnavailable
@@ -339,9 +342,10 @@ def cmd_add(args: argparse.Namespace) -> int:
     jobs.start()
     submit_failures = 0
     seen: dict[str, str] = {}
+    media = "video" if args.video or args.quality else "audio"  # a quality only means video
     for url in args.urls:
         try:
-            job = jobs.submit(url)
+            job = jobs.submit(url, media=media, quality=args.quality or "", folder=args.folder)
         except ValueError as exc:
             complain(f"{BAD_MARK} {url}: {exc}")
             submit_failures += 1
@@ -748,6 +752,14 @@ def _port_number(text: str) -> int:
     return port
 
 
+def _video_quality(text: str) -> str:
+    """argparse type for --quality: the API's rule ("720p" is 720)."""
+    try:
+        return clean_video_quality(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
 def _add_app_port(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """`--port` for the commands that talk to a running app (`config set`, `spotify ...`)."""
     parser.add_argument(
@@ -793,6 +805,26 @@ def build_parser() -> argparse.ArgumentParser:
         "(the command still waits for every download to finish)",
     )
     add.add_argument("--no-wait", dest="quiet", action="store_true", help=argparse.SUPPRESS)
+    add.add_argument(
+        "--video",
+        action="store_true",
+        help="save the video as MP4 instead of the audio (YouTube and TikTok links)",
+    )
+    add.add_argument(
+        "--quality",
+        type=_video_quality,
+        metavar="{" + ",".join(VIDEO_QUALITIES) + "}",
+        default=None,
+        help=f"video quality; implies --video (default {DEFAULT_VIDEO_QUALITY}: the highest "
+        "resolution that plays everywhere; max: up to 4K; 720 / 480: about that resolution, "
+        "smaller files)",
+    )
+    add.add_argument(
+        "--folder",
+        metavar="NAME",
+        default="",
+        help="library folder for the finished files (created if needed; default: Unsorted)",
+    )
     add.set_defaults(func=cmd_add)
 
     lst = sub.add_parser("list", help="list the tracks in the library")

@@ -73,6 +73,9 @@ _PLACEHOLDER_TITLE_RE = re.compile(r"^TikTok video #\d+$")
 # slideshow has no video); else whatever there is (the watermarked copy, outro and all).
 # A prefix match: yt-dlp renames two watermarked formats to "download-0" / "download-1".
 YDL_FORMAT = "best[format_id!^=download]/bestaudio/best"
+# Video: one file with picture and sound, not the watermarked copy if avoidable. "vcodec!=none"
+# matters: with no video at all (a photo slideshow) yt-dlp's "best" would settle for the sound.
+YDL_VIDEO_FORMAT = "best[format_id!^=download][vcodec!=none]/best[vcodec!=none]"
 SHORT_LINK_TIMEOUT = 15.0  # seconds
 # TikTok sends its short-link redirect to link-preview bots without a challenge page; yt-dlp's
 # own vm.tiktok extractor asks the same way.
@@ -270,6 +273,23 @@ def _is_tag_char(ch: str) -> bool:
     return ch in "_‌‍" or unicodedata.category(ch)[0] in "LMN"
 
 
+# What may follow "A#".."G#" in a key or chord name: "C#m", "F#minor", "G#maj7", "D#sus4".
+_KEY_SUFFIX_RE = re.compile(r"(?:m|min|minor|maj|major|dim|aug|sus|add)?\d*", re.IGNORECASE)
+
+
+def _is_musical_key(text: str, i: int) -> bool:
+    """Is the "#" at `i` the sharp of a key ("in C#m"): a lone A-G letter as its own word before
+    it, and only a key or chord suffix after it, up to the end of the word?"""
+    if i < 1 or text[i - 1].upper() not in "ABCDEFG":
+        return False
+    if i >= 2 and (text[i - 2].isalnum() or text[i - 2] == "_"):
+        return False  # "Dance#fyp": the letter ends a longer word
+    end = i + 1
+    while end < len(text) and (text[end].isalnum() or text[end] == "_"):
+        end += 1
+    return _KEY_SUFFIX_RE.fullmatch(text[i + 1 : end]) is not None
+
+
 def strip_hashtags(text: str) -> str:
     """Remove hashtags, including runs glued together ("##funny#fyp"). A tag ends where TikTok
     ends it, at anything but a letter, digit or "_": punctuation or an emoji after it stays, and
@@ -279,7 +299,16 @@ def strip_hashtags(text: str) -> str:
     i = 0
     while i < len(text):
         before = text[i - 1] if i else " "
-        if text[i] != "#" or before.isalnum() or before in "_&":
+        after = text[i + 1] if i + 1 < len(text) else " "
+        # Glued to a word, "#" starts a tag only when a tag character follows: TikTok links
+        # "СЕРИАЛ#recommendations", while "C#" (nothing after it) and a musical key ("C#m",
+        # "F#minor") are words.
+        glued = before.isalnum() or before == "_"
+        if (
+            text[i] != "#"
+            or before == "&"
+            or (glued and (not _is_tag_char(after) or _is_musical_key(text, i)))
+        ):
             out.append(text[i])
             i += 1
             continue
@@ -338,6 +367,11 @@ def caption_title(info: dict[str, Any]) -> str:
     return f"TikTok post {post_id}" if post_id else "TikTok post"
 
 
+def _has_word(text: str) -> bool:
+    """Any letter or digit: "♡" or "✧✧" alone is decoration, not a name."""
+    return any(unicodedata.category(ch)[0] in "LN" and ch not in _BLANK_FILLERS for ch in text)
+
+
 def join_artists(names: list[str]) -> str:
     """yt-dlp splits TikTok's sound author on ", " and " & " alike; join two names with " & "
     and more as "A, B & C", which gives back "Simon & Garfunkel" and "Earth, Wind & Fire" (at
@@ -362,10 +396,14 @@ def pick_tags(info: dict[str, Any]) -> tuple[str, str, str | None]:
     A post set to a named sound (a song, or a sound someone uploaded under a name) is
     "<sound artists> - <sound title>" with the sound's album. A post whose sound is its own
     audio ("original sound", see `is_generic_sound`) is "<creator> - <caption>"; the creator is
-    the display name, else the @handle.
+    the display name, else the @handle (also when the display name is only symbols, "♡": a
+    file name and a sorted library need something to read).
     """
-    creator = _clean_str(info.get("channel")) or _clean_str(info.get("uploader")) or "TikTok"
+    display = _clean_str(info.get("channel"))
     handle = _clean_str(info.get("uploader"))
+    if display and handle and not _has_word(display):
+        display = None
+    creator = display or handle or "TikTok"
     track = _clean_str(info.get("track"))
     if track and not is_generic_sound(track, creator, handle):
         return _sound_artists(info) or creator, track, _clean_str(info.get("album"))
@@ -430,9 +468,12 @@ _ERROR_RULES: youtube.ErrorRules = (
         _PAGE_UNREADABLE,
     ),
     (
-        ("requested format is not available", "no video formats found"),
-        "TikTok didn't offer any audio for this post.",
+        # Only a video download asks for a format a post can lack (audio settles for anything).
+        ("requested format is not available",),
+        "TikTok didn't offer this post in that form. A photo slideshow has no video: download "
+        "it as Audio to keep its sound.",
     ),
+    (("no video formats found",), "TikTok didn't offer anything to download for this post."),
     (
         ("unsupported url",),
         "That TikTok link doesn't lead to a video or photo post (it may have been deleted).",
@@ -444,7 +485,7 @@ _ERROR_RULES: youtube.ErrorRules = (
 def _http_status_message(code: int) -> str | None:
     if code == 403:
         return (
-            "TikTok refused to serve the audio. Try again in a minute; if it keeps happening, "
+            "TikTok refused to serve the download. Try again in a minute; if it keeps happening, "
             "yt-dlp needs an update (a newer Ultimate Playlist release)."
         )
     if code == 429:
@@ -472,6 +513,9 @@ class TikTokProvider(youtube.YouTubeProvider):
     name = PROVIDER_NAME
     display_name = "TikTok"
     ydl_format = YDL_FORMAT
+    # Video: TikTok's formats hold video and audio in one file; the best non-watermarked one.
+    # A photo slideshow has no video and fails with "Requested format is not available".
+    ydl_video_format = YDL_VIDEO_FORMAT
 
     def _tags_for(self, info: dict[str, Any]) -> tuple[str, str, str | None]:
         return pick_tags(info)

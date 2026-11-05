@@ -26,6 +26,10 @@
     <symbol id="i-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
     <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></symbol>
     <symbol id="i-folder" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+    <symbol id="i-video" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="5" width="15" height="14" rx="2"/><polygon points="23 7 17 12 23 17 23 7"/></symbol>
+    <symbol id="i-maximize" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></symbol>
+    <symbol id="i-folder-move" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><polyline points="12 10 15 13 12 16"/><line x1="8" y1="13" x2="15" y2="13"/></symbol>
+    <symbol id="i-inbox" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></symbol>
     <symbol id="i-up" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"/></symbol>
     <symbol id="i-down" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></symbol>
     <symbol id="i-retry" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></symbol>
@@ -47,6 +51,19 @@
     </div>
     <form id="download-form" class="url-form" autocomplete="off">
       <textarea id="url-input" rows="1" placeholder="Paste a YouTube, Spotify or TikTok link or playlist…" spellcheck="false" autocomplete="off" aria-label="Links to download" title="Paste one or more YouTube, Spotify or TikTok links (one per line). Enter downloads, Shift+Enter adds a line."></textarea>
+      <div class="dl-options" role="group" aria-label="Download options">
+        <div class="segmented" role="radiogroup" aria-label="Save as">
+          <button type="button" id="media-audio" class="seg active" role="radio" aria-checked="true" title="Save the audio (MP3)"><svg class="icon" aria-hidden="true"><use href="#i-music"/></svg><span>Audio</span></button>
+          <button type="button" id="media-video" class="seg" role="radio" aria-checked="false" title="Save the video (MP4). YouTube and TikTok; Spotify links stay audio."><svg class="icon" aria-hidden="true"><use href="#i-video"/></svg><span>Video</span></button>
+        </div>
+        <select id="quality" class="select" aria-label="Video quality" title="Video quality" hidden>
+          <option value="best">Best (plays everywhere)</option>
+          <option value="max">Maximum (up to 4K)</option>
+          <option value="720">720p</option>
+          <option value="480">480p (small files)</option>
+        </select>
+        <select id="save-folder" class="select" aria-label="Save to folder" title="Folder for these downloads"></select>
+      </div>
       <button type="submit" id="download-btn" class="btn btn-primary">
         <svg class="icon" aria-hidden="true"><use href="#i-download"/></svg>
         <span>Download</span>
@@ -72,24 +89,41 @@
       </nav>
 
       <div id="tab-library" class="tab-pane active" role="tabpanel">
-        <div class="toolbar">
-          <input id="search" class="input" type="search" placeholder="Search title, artist or album…" aria-label="Search library">
-          <span id="library-count" class="muted count"></span>
-          <div id="selection-bar" class="selection-bar" hidden>
-            <span id="selection-count"></span>
-            <button type="button" id="add-selected" class="btn btn-sm btn-primary">
-              <svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg>
-              <span>Add selected to playlist</span>
-            </button>
-            <button type="button" id="clear-selection" class="btn btn-sm btn-ghost">Clear</button>
+        <div class="library-layout">
+          <nav class="folder-rail" aria-label="Folders">
+            <div class="toolbar">
+              <h3>Folders</h3>
+              <span class="spacer"></span>
+              <button type="button" id="new-folder" class="icon-btn" title="New folder" aria-label="New folder"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg></button>
+            </div>
+            <ul id="folder-list" class="folder-list"></ul>
+            <p class="folder-hint muted">Drag tracks onto a folder, or select them and use Move to folder.</p>
+          </nav>
+          <div class="library-main">
+            <div class="toolbar">
+              <input id="search" class="input" type="search" placeholder="Search title, artist or album…" aria-label="Search library">
+              <span id="library-count" class="muted count"></span>
+              <div id="selection-bar" class="selection-bar" hidden>
+                <span id="selection-count"></span>
+                <button type="button" id="move-selected" class="btn btn-sm">
+                  <svg class="icon" aria-hidden="true"><use href="#i-folder-move"/></svg>
+                  <span>Move to folder</span>
+                </button>
+                <button type="button" id="add-selected" class="btn btn-sm btn-primary">
+                  <svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg>
+                  <span>Add to playlist</span>
+                </button>
+                <button type="button" id="clear-selection" class="btn btn-sm btn-ghost">Clear</button>
+              </div>
+              <span class="spacer"></span>
+              <button type="button" id="rescan" class="btn btn-ghost btn-sm" title="Pick up files added to the library folder outside the app">
+                <svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg>
+                <span>Rescan</span>
+              </button>
+            </div>
+            <div id="library-list" class="scroll"></div>
           </div>
-          <span class="spacer"></span>
-          <button type="button" id="rescan" class="btn btn-ghost btn-sm" title="Pick up files added to the library folder outside the app">
-            <svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg>
-            <span>Rescan</span>
-          </button>
         </div>
-        <div id="library-list" class="scroll"></div>
       </div>
 
       <div id="tab-playlists" class="tab-pane" role="tabpanel">
@@ -106,6 +140,20 @@
             <ul id="playlist-list" class="pl-list"></ul>
           </div>
           <div id="playlist-detail" class="pl-detail"></div>
+        </div>
+      </div>
+
+      <div id="video-panel" class="video-panel" hidden>
+        <div class="video-head">
+          <svg class="icon" aria-hidden="true"><use href="#i-video"/></svg>
+          <span id="video-title" class="video-title"></span>
+          <span class="spacer"></span>
+          <button type="button" id="video-fullscreen" class="icon-btn" title="Full screen (F)" aria-label="Full screen"><svg class="icon" aria-hidden="true"><use href="#i-maximize"/></svg></button>
+          <button type="button" id="video-hide" class="icon-btn" title="Hide the video (it keeps playing)" aria-label="Hide the video"><svg class="icon" aria-hidden="true"><use href="#i-x"/></svg></button>
+        </div>
+        <div class="video-frame">
+          <!-- The one media element of the player: a <video> plays audio files too, unseen while the panel is hidden. -->
+          <video id="audio" preload="metadata" playsinline></video>
         </div>
       </div>
     </section>
@@ -134,10 +182,10 @@
       </div>
     </div>
     <div class="volume">
+      <button type="button" id="btn-video" class="icon-btn" title="Show the video" aria-label="Show the video" hidden><svg class="icon" aria-hidden="true"><use href="#i-video"/></svg></button>
       <button type="button" id="btn-mute" class="icon-btn" title="Mute"><svg class="icon" aria-hidden="true"><use href="#i-volume"/></svg></button>
       <input id="volume" type="range" min="0" max="1" step="0.01" value="1" aria-label="Volume">
     </div>
-    <audio id="audio" preload="metadata"></audio>
   </footer>
 
   <div id="toasts" class="toasts" aria-live="assertive"></div>

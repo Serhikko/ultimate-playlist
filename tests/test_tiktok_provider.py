@@ -247,6 +247,15 @@ def test_named_sounds(track: str) -> None:
         ("मेरा गाना #प्यारहै आज", "मेरा गाना आज"),  # a Devanagari tag with its vowel signs
         ("เพลงนี้ #เพลงไทย ดีมาก", "เพลงนี้ ดีมาก"),  # Thai
         ("Tom &#38; Jerry #tag", "Tom &#38; Jerry"),  # "&#" starts no tag
+        # A tag glued to a word is still a tag (TikTok links it); "C#" with nothing after is not.
+        ("СЕРИАЛ: МЕНТАЛИСТ#recommendations", "СЕРИАЛ: МЕНТАЛИСТ"),
+        ("Dance#fyp#viral time", "Dance time"),
+        ("Hello# world", "Hello# world"),
+        # A musical key is not a tag, glued "#" or not.
+        ("Piano cover in C#m #piano", "Piano cover in C#m"),
+        ("F#minor etude", "F#minor etude"),
+        ("Bach Prelude in C#major", "Bach Prelude in C#major"),
+        ("Riff in G#7 and D#sus4", "Riff in G#7 and D#sus4"),
         ("price #1 #fyp", "price"),
         # A tag at the start of a line, or after a finished sentence, takes its punctuation along.
         ("#mom! Love you", "Love you"),
@@ -376,6 +385,12 @@ def test_pick_tags_original_sound_uses_creator_and_caption() -> None:
     assert pick_tags(info)[0] == "tatemcrae"  # no display name: the @handle
     info.update(channel="ㅤ")
     assert pick_tags(info)[0] == "tatemcrae"  # a "blank" display name is no name either
+    info.update(channel="♡")
+    assert pick_tags(info)[0] == "tatemcrae"  # only symbols: the @handle reads better
+    info.update(channel="♡", uploader=None)
+    assert pick_tags(info)[0] == "♡"  # unless there is nothing else
+    info.update(channel="Anna ♡", uploader="anna")
+    assert pick_tags(info)[0] == "Anna ♡"
     assert pick_tags({"id": "1"}) == ("TikTok", "TikTok post 1", None)
 
 
@@ -401,10 +416,11 @@ def test_pick_tags_original_sound_uses_creator_and_caption() -> None:
         # TikTok moved its data: no data script at all, or one without the post (status 0).
         ("[TikTok] 1: Unexpected response from webpage request", "newer yt-dlp"),
         ("[TikTok] 1: Video not available, status code 0", "newer yt-dlp"),
-        ("[TikTok] 1: Requested format is not available", "didn't offer any audio"),
+        ("[TikTok] 1: Requested format is not available", "download it as Audio"),
+        ("[TikTok] 1: No video formats found!", "anything to download"),
         ("ERROR: Unsupported URL: https://www.tiktok.com/?_r=1", "doesn't lead to a video"),
         ("[Errno 11001] getaddrinfo failed", "Couldn't reach TikTok"),
-        ("Postprocessing: audio conversion failed: ffmpeg exited", "Converting the audio"),
+        ("Postprocessing: audio conversion failed: ffmpeg exited", "Converting the download"),
         ("unable to download video data: HTTP Error 403: Forbidden", "refused to serve"),
         ("HTTP Error 429: Too Many Requests", "rate-limiting"),
         ("HTTP Error 404: Not Found", "deleted"),

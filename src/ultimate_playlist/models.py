@@ -113,6 +113,10 @@ class Job:
     track: Track | None = None
     created_at: str = field(default_factory=utc_now_iso)
     updated_at: str = field(default_factory=utc_now_iso)
+    # Download options, chosen next to the Download button; a playlist's tracks inherit them.
+    media: str = "audio"  # "audio" | "video"
+    quality: str = ""  # video quality key ("best", "max", "720", "480"); "" for audio
+    folder: str = ""  # library folder the finished file goes to ("" = Unsorted)
 
     @property
     def title(self) -> str:
@@ -140,6 +144,9 @@ class Job:
             "track": self.track.to_dict() if self.track else None,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "media": self.media,
+            "quality": self.quality,
+            "folder": self.folder,
         }
 
 

@@ -121,9 +121,12 @@ input[type="search"]::-webkit-search-cancel-button { cursor: pointer; }
   font-weight: 700; font-size: 15px; letter-spacing: -0.01em; white-space: nowrap;
 }
 .brand .icon { width: 22px; height: 22px; color: var(--accent); }
-.url-form { flex: 1; display: flex; gap: 8px; align-items: flex-start; min-width: 240px; }
+.url-form { flex: 1; display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; min-width: 240px; }
+/* The box keeps at least 240px; the options drop to a second line when the window has no
+   room for them beside it, instead of widening the page past the window (which clips
+   Settings and the player) or squeezing the box. */
 .url-form textarea {
-  flex: 1; resize: none; min-height: 34px; max-height: 120px; height: 34px;
+  flex: 1 1 240px; min-width: 0; resize: none; min-height: 34px; max-height: 120px; height: 34px;
   padding: 6px 10px; border-radius: var(--radius-sm);
   border: 1px solid var(--border-strong); background: var(--bg); color: var(--text);
   line-height: 20px; outline: none; font-family: var(--font);
@@ -450,10 +453,86 @@ dialog.dialog-wide { width: min(560px, 94vw); }
 }
 .btn-link:hover { text-decoration: underline; }
 
+/* ---------------------------------------------------------------- Download options */
+.dl-options { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; min-width: 0; }
+.segmented {
+  display: inline-flex; height: 34px; border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm); overflow: hidden; background: var(--bg);
+}
+.seg {
+  display: inline-flex; align-items: center; gap: 5px; padding: 0 10px; border: 0;
+  background: transparent; color: var(--text-dim); font: inherit; font-size: 13px; cursor: pointer;
+}
+.seg + .seg { border-left: 1px solid var(--border-strong); }
+.seg .icon { width: 14px; height: 14px; }
+.seg:hover { color: var(--text); background: var(--panel-3); }
+.seg.active { background: var(--accent-soft); color: var(--text); }
+.seg.active .icon { color: var(--accent); }
+.select {
+  height: 34px; max-width: 190px; padding: 0 8px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong); background: var(--bg); color: var(--text);
+  font: inherit; font-size: 13px; outline: none; cursor: pointer;
+}
+.select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.select option { background: var(--panel); color: var(--text); }
+
+/* ---------------------------------------------------------------- Folders */
+.library-layout { display: grid; grid-template-columns: 210px minmax(0, 1fr); flex: 1; min-height: 0; }
+.library-main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.folder-rail { border-right: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; background: var(--panel); }
+.folder-list { list-style: none; margin: 0; padding: 6px; overflow-y: auto; flex: 1; min-height: 0; }
+.folder-item {
+  display: flex; align-items: center; gap: 8px; padding: 6px 8px 6px 10px; border-radius: var(--radius-sm);
+  cursor: pointer; color: var(--text-dim); user-select: none; border: 1px dashed transparent;
+}
+.folder-item:hover { background: var(--panel-2); color: var(--text); }
+.folder-item.active { background: var(--accent-soft); color: var(--text); }
+.folder-item .icon { color: var(--muted); width: 14px; height: 14px; flex: none; }
+.folder-item.active .icon { color: var(--accent); }
+.folder-item.drop-target { border-color: var(--accent); background: var(--accent-soft); color: var(--text); }
+.folder-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.folder-count { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.folder-item .icon-btn { width: 22px; height: 22px; opacity: 0; }
+.folder-item .icon-btn .icon { width: 12px; height: 12px; }
+.folder-item:hover .icon-btn, .folder-item:focus-within .icon-btn { opacity: 1; }
+.folder-sep { height: 1px; background: var(--border); margin: 6px 4px; }
+.folder-hint { font-size: 11.5px; padding: 8px 12px 12px; line-height: 1.4; }
+.media-tag, .folder-tag {
+  display: inline-block; margin-left: 6px; padding: 0 5px; border-radius: 4px; vertical-align: 1px;
+  font-size: 10.5px; font-weight: 600; letter-spacing: 0.03em; line-height: 16px;
+}
+.media-tag { background: var(--purple-soft); color: var(--purple); }
+.folder-tag { background: var(--panel-3); color: var(--text-dim); font-weight: 500; letter-spacing: 0; }
+.track-row.dragging { opacity: 0.45; }
+.job-tags { margin-top: 2px; font-size: 11.5px; color: var(--text-dim); }
+
+/* ---------------------------------------------------------------- Video panel */
+.content { position: relative; }
+.video-panel {
+  position: absolute; inset: 0; z-index: 4; display: flex; flex-direction: column;
+  background: #000; border-left: 1px solid var(--border);
+}
+.video-panel[hidden] { display: none; }
+.video-head {
+  display: flex; align-items: center; gap: 8px; padding: 6px 8px 6px 14px; flex: none;
+  background: var(--panel); border-bottom: 1px solid var(--border);
+}
+.video-head > .icon { width: 15px; height: 15px; color: var(--purple); }
+.video-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.video-frame { flex: 1; min-height: 0; display: flex; }
+.video-frame video { width: 100%; height: 100%; object-fit: contain; background: #000; cursor: pointer; }
+
 /* ---------------------------------------------------------------- Responsive */
+@media (max-width: 1280px) {
+  /* The download bar keeps its options: the labels go, the icons and selects stay. */
+  .seg span { display: none; }
+  .select { max-width: 150px; }
+}
 @media (max-width: 1060px) {
   .layout { grid-template-columns: 270px minmax(0, 1fr); }
   .playlists-layout { grid-template-columns: 200px minmax(0, 1fr); }
+  .library-layout { grid-template-columns: 170px minmax(0, 1fr); }
+  .folder-hint { display: none; }
   .col-date { display: none; }
   .toolbar input[type="search"] { width: 200px; }
   /* Narrow windows: swap the long label for a short one ("ff", "JS", "Lib") instead of hiding
@@ -466,6 +545,8 @@ dialog.dialog-wide { width: min(560px, 94vw); }
 }
 @media (max-width: 920px) {
   .layout { grid-template-columns: 240px minmax(0, 1fr); }
+  .topbar { flex-wrap: wrap; }
+  .url-form { flex-wrap: wrap; }
   .brand span { display: none; }
   .col-artist { display: none; }
   .player { grid-template-columns: minmax(140px, 1fr) minmax(0, 2fr) auto; }
